@@ -4030,11 +4030,136 @@ Sema::ActOnCilkForStmt(SourceLocation CilkForLoc, SourceLocation LParenLoc,
                                    OgInc, CilkForLoc, LParenLoc, RParenLoc);
 }
 
+StmtResult Sema::FinishCilkForRangeWalkStmt(Stmt *S, Stmt *B) {
+  CilkForRangeWalkStmt *CilkForRangeWalk = cast<CilkForRangeWalkStmt>(S);
+  
+  std::cout << "FINISH: Starting FinishCilkForRangeWalkStmt" << std::endl;
+  
+  // Set the body of the statement
+  CilkForRangeWalk->setBody(B);
+  
+  // Check for empty body and warn if found
+  if (isa<NullStmt>(B)) {
+    Diag(CilkForRangeWalk->getForLoc(), diag::warn_empty_cilk_for_body);
+    getCurCompoundScope().setHasEmptyLoopBodies();
+  }
+  
+  // Search for return statements and check for break/continue
+  SearchForReturnInStmt(*this, B);
+  
+  if (BreakContinueFinder(*this, B).BreakFound()) {
+    Diag(CilkForRangeWalk->getForLoc(), diag::err_cilk_for_cannot_break);
+  }
+  
+  // Get the loop variable declaration
+  VarDecl *LoopVar = cast<VarDecl>(CilkForRangeWalk->getLoopVarStmt()->getSingleDecl());
+  
+  // Get the BeginWalk variable
+  VarDecl *BeginWalkVar = cast<VarDecl>(
+      CilkForRangeWalk->getBeginWalkStmt()->getSingleDecl());
+  
+  // Check if we're dealing with a dependent type
+  QualType BeginWalkType = BeginWalkVar->getType();
+  bool isDependent = BeginWalkType->isDependentType();
+  
+  if (isDependent) {
+    std::cout << "FINISH: Detected dependent type in FinishCilkForRangeWalkStmt" << std::endl;
+    
+    // For dependent types, we defer actual type checking and resolution
+    // until template instantiation time. We just set up the necessary
+    // AST structures without doing detailed type checking.
+    
+    // Create a dependent reference to BeginWalkVar
+    ExprResult BeginWalkRef = BuildDeclRefExpr(
+        BeginWalkVar, 
+        BeginWalkType,
+        VK_LValue, 
+        CilkForRangeWalk->getColonLoc());
+    
+    if (BeginWalkRef.isInvalid()) {
+      std::cout << "FINISH: BeginWalkRef is invalid in dependent context" << std::endl;
+      return StmtError();
+    }
+    
+    // Create a dependent dereference expression
+    ExprResult DerefExpr;
+    if (BeginWalkType->isDependentType()) {
+      // Build a dependent unary operator expression
+      DerefExpr = UnaryOperator::Create(
+        Context,                               // const ASTContext &C
+        BeginWalkRef.get(),                    // Expr *input
+        UO_Deref,                              // Opcode opc
+        Context.DependentTy,                   // QualType type
+        VK_LValue,                             // ExprValueKind VK
+        OK_Ordinary,                           // ExprObjectKind OK
+        LoopVar->getBeginLoc(),                // SourceLocation l
+        /*CanOverflow=*/false,                 // bool CanOverflow
+        FPOptionsOverride()                    // FPOptionsOverride FPFeatures
+      );
+    } else {
+      // If the expression isn't dependent, use the normal path
+      DerefExpr = CreateBuiltinUnaryOp(
+          LoopVar->getBeginLoc(), 
+          UO_Deref,
+          BeginWalkRef.get());
+    }
+    
+    if (DerefExpr.isInvalid()) {
+      std::cout << "FINISH: DerefExpr is invalid in dependent context" << std::endl;
+      return StmtError();
+    }
+    
+    // Initialize the loop variable with the dereferenced value
+    // For dependent contexts, this will be resolved during instantiation
+    AddInitializerToDecl(LoopVar, DerefExpr.get(), /*DirectInit=*/false);
+    
+  } else {
+    std::cout << "FINISH: Processing non-dependent type" << std::endl;
+    
+    // For non-dependent types, perform normal processing with type checking
+    const QualType BeginWalkNonRefType = BeginWalkType.getNonReferenceType();
+    ExprResult BeginWalkRef = BuildDeclRefExpr(
+        BeginWalkVar, 
+        BeginWalkNonRefType,
+        VK_LValue, 
+        CilkForRangeWalk->getColonLoc());
+    
+    if (BeginWalkRef.isInvalid()) {
+      std::cout << "FINISH: BeginWalkRef is invalid" << std::endl;
+      return StmtError();
+    }
+    
+    // Create a dereference expression to get the loop variable's value
+    ExprResult DerefExpr = CreateBuiltinUnaryOp(
+        LoopVar->getBeginLoc(), 
+        UO_Deref,
+        BeginWalkRef.get());
+    
+    if (DerefExpr.isInvalid()) {
+      std::cout << "FINISH: DerefExpr is invalid" << std::endl;
+      Diag(LoopVar->getBeginLoc(), diag::note_for_range_invalid_iterator)
+          << LoopVar->getBeginLoc() << 1 << BeginWalkRef.get()->getType();
+      return StmtError();
+    }
+    
+    // Initialize the loop variable with the dereferenced value
+    AddInitializerToDecl(LoopVar, DerefExpr.get(), /*DirectInit=*/false);
+  }
+  
+  std::cout << "FINISH: Successfully completed FinishCilkForRangeWalkStmt" << std::endl;
+  
+  return CilkForRangeWalk;
+}
 
 StmtResult Sema::FinishCilkForRangeStmt(Stmt *S, Stmt *B) {
   if (!S || !B)
     return StmtError();
 
+  if (CilkForRangeWalkStmt *WalkStmt = dyn_cast<CilkForRangeWalkStmt>(S)) {
+    std::cout << "Going into FinishCilkForRangeWalk" << std::endl;
+    return FinishCilkForRangeWalkStmt(WalkStmt, B);
+  }
+  std::cout << "continuing into FinishCilkForRange" << std::endl;
   CilkForRangeStmt *CilkForRange = cast<CilkForRangeStmt>(S);
 
   StmtResult ForRange =
@@ -4626,8 +4751,6 @@ Sema::FindContainerBeginWalkFunction(Expr *Container) {
   // Return the member function (not yet called)
   return MemberExpr;
 }
-
-
 
 StmtResult Sema::BuildCilkForRangeStmt(CXXForRangeStmt *ForRange) {
   Scope *S = getCurScope();

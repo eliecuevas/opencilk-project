@@ -5347,6 +5347,7 @@ public:
   ExprResult FindContainerWalkFunction(Expr *Container);
   ExprResult FindContainerBeginWalkFunction(Expr *Container);
   StmtResult FinishCilkForRangeStmt(Stmt *S, Stmt *B);
+  StmtResult FinishCilkForRangeWalkStmt(Stmt *S, Stmt *B);
   StmtResult BuildCilkForStmt(SourceLocation CilkForLoc,
                               SourceLocation LParenLoc,
                               Stmt *Init, Expr *Cond, Expr *Inc,
