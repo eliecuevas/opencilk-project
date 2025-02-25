@@ -12,6 +12,7 @@
 
 #include "clang/Parse/RAIIObjectsForParser.h"
 #include "clang/Parse/Parser.h"
+#include <iostream>
 
 using namespace clang;
 
@@ -445,6 +446,7 @@ StmtResult Parser::ParseCilkForStatement(SourceLocation *TrailingElseLoc) {
     Diag(ForLoc, diag::warn_cilk_for_forrange_loop_experimental);
     ExprResult CorrectedRange =
         Actions.CorrectDelayedTyposInExpr(ForRangeInfo.RangeExpr.get());
+    std::cout << "Going into ActOnCilkForRangeStmt" << std::endl;
     ForRangeStmt = Actions.ActOnCilkForRangeStmt(
         getCurScope(), ForLoc, FirstPart.get(), ForRangeInfo.LoopVar.get(),
         ForRangeInfo.ColonLoc, CorrectedRange.get(), T.getCloseLocation(),
@@ -507,8 +509,10 @@ StmtResult Parser::ParseCilkForStatement(SourceLocation *TrailingElseLoc) {
   // if (ForEach)
   //   return Actions.FinishObjCForCollectionStmt(ForEachStmt.get(), Body.get());
 
-  if (ForRangeInfo.ParsedForRangeDecl())
+  if (ForRangeInfo.ParsedForRangeDecl()){
+    std::cout << "Going into FinishCilkForRangeStmt" << std::endl;
     return Actions.FinishCilkForRangeStmt(ForRangeStmt.get(), Body.get());
+  }
 
   return Actions.ActOnCilkForStmt(ForLoc, T.getOpenLocation(), FirstPart.get(),
                                   nullptr, Sema::ConditionResult(), nullptr,

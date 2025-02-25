@@ -4030,6 +4030,7 @@ Sema::ActOnCilkForStmt(SourceLocation CilkForLoc, SourceLocation LParenLoc,
                                    OgInc, CilkForLoc, LParenLoc, RParenLoc);
 }
 
+
 StmtResult Sema::FinishCilkForRangeStmt(Stmt *S, Stmt *B) {
   if (!S || !B)
     return StmtError();
@@ -4130,7 +4131,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
                                           SourceLocation RParenLoc,
                                           BuildForRangeKind Kind) {
 
-  std::cout << "in ActOnCilkForRangeWalkStmt" << std::endl;
+  std::cout << "ACT: in ActOnCilkForRangeWalkStmt" << std::endl;
   if (!First) {
     return StmtError();
   }
@@ -4185,7 +4186,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     RangeDecl = ActOnDeclStmt(RangeGroup, RangeLoc, RangeLoc);
     if (RangeDecl.isInvalid()) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: error in create range declaration statement" << std::endl;
+      std::cout << "ACT dependent: error in create range declaration statement" << std::endl;
       return StmtError();
     }
 
@@ -4194,7 +4195,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     VK_LValue, RangeLoc);
     if (RangeRef.isInvalid()) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: rangeref is invalid" << std::endl;
+      std::cout << "ACT dependent: rangeref is invalid" << std::endl;
       return StmtError();
     }
 
@@ -4269,7 +4270,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     // Non-dependent case - use the original implementation
     if (FinishForRangeVarDecl(*this, RangeVar, Range, RangeLoc,
     diag::err_for_range_deduction_failure)) {
-      std::cout << "ACT: error in FinishForRangeVarDecl" << std::endl;
+      std::cout << "ACT independent: error in FinishForRangeVarDecl" << std::endl;
       ActOnInitializerError(LoopVar);
       return StmtError();
     }
@@ -4280,7 +4281,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     RangeDecl = ActOnDeclStmt(RangeGroup, RangeLoc, RangeLoc);
     if (RangeDecl.isInvalid()) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: error in create range declaration statement" << std::endl;
+      std::cout << "ACT independent: error in create range declaration statement" << std::endl;
     return StmtError();
     }
 
@@ -4288,7 +4289,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     ExprResult BeginWalkMember = FindContainerBeginWalkFunction(Range);
 
     if (WalkMember.isInvalid() || BeginWalkMember.isInvalid()) {
-      std::cout << "ACT: walk or begin is invalid" << std::endl;
+      std::cout << "ACT independent: walk or begin is invalid" << std::endl;
       ActOnInitializerError(LoopVar);
       return StmtError();
     }
@@ -4298,11 +4299,11 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     VK_LValue, RangeLoc);
     if (RangeRef.isInvalid()) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: rangeref is invalid" << std::endl;
+      std::cout << "ACT independent: rangeref is invalid" << std::endl;
       return StmtError();
-  }
+    }
 
-    std::cout << "ACT: built declrefexpr" << std::endl;
+    std::cout << "ACT independent: built declrefexpr" << std::endl;
     CXXScopeSpec SS;
     IdentifierInfo &WalkII = PP.getIdentifierTable().get("CilkWalk");
     DeclarationName WalkName = Context.DeclarationNames.getIdentifier(&WalkII);
@@ -4311,7 +4312,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     QualType RangeType = RangeVar->getType();
     CXXRecordDecl *RangeClass = RangeType->getAsCXXRecordDecl();
     if (!RangeClass) {
-      std::cout << "ACT: RangeClass is null for non-dependent type" << std::endl;
+      std::cout << "ACT independent: RangeClass is null for non-dependent type" << std::endl;
       ActOnInitializerError(LoopVar);
       return StmtError();
     }
@@ -4326,7 +4327,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     /*SuppressQualifierCheck=*/false);
 
     if (WalkAccess.isInvalid()) {
-      std::cout << "ACT: WalkAccess is invalid" << std::endl;
+      std::cout << "ACT independent: WalkAccess is invalid" << std::endl;
       ActOnInitializerError(LoopVar);
       return StmtError();
     }
@@ -4335,7 +4336,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     /*args*/ {}, RangeLoc);
     if (WalkCall.isInvalid()) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: WalkCall is invalid" << std::endl;
+      std::cout << "ACT independent: WalkCall is invalid" << std::endl;
       return StmtError();
     }
 
@@ -4345,7 +4346,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     if (FinishForRangeVarDecl(*this, WalkVar, WalkCall.get(), RangeLoc,
       diag::err_for_range_deduction_failure)) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: for range deduction failure" << std::endl;
+      std::cout << "ACT independent: for range deduction failure" << std::endl;
       return StmtError();
     }
 
@@ -4353,7 +4354,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     WalkDecl = ActOnDeclStmt(WalkGroup, RangeLoc, RangeLoc);
     if (WalkDecl.isInvalid()) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: walkDecl is invalid" << std::endl;
+      std::cout << "ACT independent: walkDecl is invalid" << std::endl;
       return StmtError();
     }
 
@@ -4371,7 +4372,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
 
     if (BeginWalkAccess.isInvalid()) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: beginwalkaccess is invalid" << std::endl;
+      std::cout << "ACT independent: beginwalkaccess is invalid" << std::endl;
       return StmtError();
     }
 
@@ -4379,7 +4380,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     /*args*/ {}, RangeLoc);
     if (BeginWalkCall.isInvalid()) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: beginwalkaccess is invalid" << std::endl;
+      std::cout << "ACT independent: beginwalkaccess is invalid" << std::endl;
       return StmtError();
     }
 
@@ -4389,7 +4390,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     if (FinishForRangeVarDecl(*this, BeginWalkVar, BeginWalkCall.get(), RangeLoc,
     diag::err_for_range_deduction_failure)) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: beginwalkvar is invalid" << std::endl;
+      std::cout << "ACT independent: beginwalkvar is invalid" << std::endl;
       return StmtError();
     }
 
@@ -4398,7 +4399,7 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     BeginWalkDecl = ActOnDeclStmt(BeginWalkGroup, RangeLoc, RangeLoc);
     if (BeginWalkDecl.isInvalid()) {
       ActOnInitializerError(LoopVar);
-      std::cout << "ACT: beginWalkDecl is invalid" << std::endl;
+      std::cout << "ACT independent: beginWalkDecl is invalid" << std::endl;
       return StmtError();
     }
   }
@@ -4416,35 +4417,40 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
 }
 
 StmtResult Sema::BuildCilkForRangeWalkStmt(CilkForRangeWalkStmt *ForRangeWalkStmt) {
-  std::cout << "in build cilkForRangeWalk" << std::endl;
+  std::cout << "BUILD: in build cilkForRangeWalk" << std::endl;
   // Get the loop variable
   Decl *LoopVar = ForRangeWalkStmt->getLoopVarStmt()->getSingleDecl();
-  if (LoopVar->isInvalidDecl())
+  if (LoopVar->isInvalidDecl()){
+    std::cout << "BUILD: LoopVar is invalid" << std::endl;
     return StmtError();
-  
+  }
   VarDecl *LoopVarDecl = cast<VarDecl>(LoopVar);
-  
+  std::cout << "BUILD: casted LoopVarDecl" << std::endl;
+
   // Get the BeginWalkVar
   VarDecl *BeginWalkVar = cast<VarDecl>(
       ForRangeWalkStmt->getBeginWalkStmt()->getSingleDecl());
-  
+  std::cout << "BUILD: casted beginWalkVar" << std::endl;
+
   // Set up the loop variable with the appropriate initializer
   // Build a DeclRefExpr for the BeginWalkVar
   ExprResult BeginWalkRef = BuildDeclRefExpr(BeginWalkVar, BeginWalkVar->getType(),
                                           VK_LValue, LoopVar->getBeginLoc());
-  if (BeginWalkRef.isInvalid())
+  if (BeginWalkRef.isInvalid()){
+    std::cout << "BUILD: begin walk ref is invalid" << std::endl;
     return StmtError();
-  
+  }
   // We need to dereference the walk iterator to get the loop variable's value
   ExprResult DerefExpr = CreateBuiltinUnaryOp(LoopVar->getBeginLoc(), UO_Deref,
                                           BeginWalkRef.get());
-  if (DerefExpr.isInvalid())
+  if (DerefExpr.isInvalid()){
+  std::cout << "BUILD: derefexpr is invalid" << std::endl;
     return StmtError();
-  
+  }
   // Initialize the loop variable with the dereferenced value
   AddInitializerToDecl(LoopVarDecl, DerefExpr.get(), 
                      /*DirectInit=*/false);
-  
+  std::cout << "BUILD: successfully returning" << std::endl;
   // Nothing else needs to be done to the ForRangeWalkStmt
   return ForRangeWalkStmt;
 }
@@ -4526,9 +4532,10 @@ Sema::FindContainerWalkFunction(Expr *Container) {
       /*SuppressQualifierCheck=*/false,
       /*ExtraArgs=*/nullptr);     // ActOnMemberAccessExtraArgs
       
-  if (MemberExpr.isInvalid())
+  if (MemberExpr.isInvalid()) {
     std::cout << "FIND W: CilkWalk memberexpr invalid" << std::endl;
     return ExprError();
+  }
     std::cout << "FIND W: CilkWalk found" << std::endl;
   // Return the member function (not yet called)
   return MemberExpr;
@@ -4611,10 +4618,11 @@ Sema::FindContainerBeginWalkFunction(Expr *Container) {
       /*SuppressQualifierCheck=*/false,
       /*ExtraArgs=*/nullptr);     // ActOnMemberAccessExtraArgs
       
-  if (MemberExpr.isInvalid())
+  if (MemberExpr.isInvalid()){
     std::cout << "FIND W: CilkBeginWalk memberexpr invalid" << std::endl;
     return ExprError();
-    std::cout << "FIND W: CilkBeginWalk found" << std::endl;
+  }
+  std::cout << "FIND W: CilkBeginWalk found" << std::endl;
   // Return the member function (not yet called)
   return MemberExpr;
 }
