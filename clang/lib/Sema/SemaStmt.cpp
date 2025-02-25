@@ -4125,20 +4125,20 @@ StmtResult Sema::ActOnCilkForRangeStmt(Scope *S, SourceLocation ForLoc,
 }
 
 StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
-                                           Stmt *InitStmt, Stmt *First,
-                                           SourceLocation ColonLoc, Expr *Range,
-                                           SourceLocation RParenLoc,
-                                           BuildForRangeKind Kind) {
-  
+                                          Stmt *InitStmt, Stmt *First,
+                                          SourceLocation ColonLoc, Expr *Range,
+                                          SourceLocation RParenLoc,
+                                          BuildForRangeKind Kind) {
+
   std::cout << "in ActOnCilkForRangeWalkStmt" << std::endl;
-  if (!First){
+  if (!First) {
     return StmtError();
   }
   if (Range && ObjCEnumerationCollection(Range)) {
-    // Not supporting Objective C in Cilk right now
-      Diag(InitStmt->getBeginLoc(), diag::err_cilk_for_range_walk_no_objc)
-                 << InitStmt->getSourceRange();
-      return StmtError();
+  // Not supporting Objective C in Cilk right now
+    Diag(InitStmt->getBeginLoc(), diag::err_cilk_for_range_walk_no_objc)
+    << InitStmt->getSourceRange();
+    return StmtError();
   }
   DeclStmt *DS = dyn_cast<DeclStmt>(First);
   assert(DS && "first part of for range not a decl stmt");
@@ -4160,155 +4160,259 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
 
   const auto DepthStr = std::to_string(S->getDepth() / 2);
   VarDecl *RangeVar = BuildForRangeVarDecl(*this, RangeLoc,
-                                          Context.getAutoRRefDeductType(),
-                                          std::string("__cilk_range") + DepthStr);
+  Context.getAutoRRefDeductType(),
+  std::string("__cilk_range") + DepthStr);
 
-  // Before calling FinishForRangeVarDecl, check if the range is dependent
-  if (Range->isTypeDependent() || Range->isValueDependent()) {
+  // Set up variables we'll need in both branches
+  StmtResult RangeDecl;
+  StmtResult WalkDecl;
+  StmtResult BeginWalkDecl;
+
+  // Check if the range is dependent
+  bool isDependent = Range->isTypeDependent() || Range->isValueDependent();
+
+  if (isDependent) {
     // For dependent ranges, set up a dependent variable without trying to deduce
     std::cout << "ACT: dependent type detected" << std::endl;
     RangeVar->setType(Context.DependentTy);
     AddInitializerToDecl(RangeVar, Range, /*DirectInit=*/false);
     FinalizeDeclaration(RangeVar);
     CurContext->addHiddenDecl(RangeVar);
-    std::cout << "ACT: handled dependent type?" << std::endl;
-    
+
+    // Create the range declaration statement
+    DeclGroupPtrTy RangeGroup =
+    BuildDeclaratorGroup(MutableArrayRef<Decl *>((Decl **)&RangeVar, 1));
+    RangeDecl = ActOnDeclStmt(RangeGroup, RangeLoc, RangeLoc);
+    if (RangeDecl.isInvalid()) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: error in create range declaration statement" << std::endl;
+      return StmtError();
+    }
+
+    // Build reference to RangeVar
+    ExprResult RangeRef = BuildDeclRefExpr(RangeVar, RangeVar->getType(),
+    VK_LValue, RangeLoc);
+    if (RangeRef.isInvalid()) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: rangeref is invalid" << std::endl;
+      return StmtError();
+    }
+
+    // Create dependent member expressions for both CilkWalk and CilkBeginWalk methods
+
+    // For CilkWalk
+    DeclarationNameInfo WalkDNI(
+    Context.DeclarationNames.getIdentifier(&PP.getIdentifierTable().get("CilkWalk")),
+    RangeLoc);
+
+    ExprResult WalkAccess = CXXDependentScopeMemberExpr::Create(
+    Context,
+    RangeRef.get(),
+    RangeVar->getType(),
+    /*IsArrow=*/false,
+    /*OpLoc=*/RangeLoc,
+    /*QualifierLoc=*/NestedNameSpecifierLoc(),
+    /*TemplateKWLoc=*/SourceLocation(),
+    /*FirstQualifierInScope=*/nullptr,
+    WalkDNI,
+    /*TemplateArgs=*/nullptr);
+
+    // Create a dependent call expression for CilkWalk
+    ExprResult WalkCall = ActOnCallExpr(S, WalkAccess.get(), RangeLoc,
+    /*args*/ {}, RangeLoc);
+
+    // Create WalkVar with dependent type
+    VarDecl *WalkVar = BuildForRangeVarDecl(*this, RangeLoc,
+    Context.DependentTy,
+    std::string("__cilk_walk") + DepthStr);
+    AddInitializerToDecl(WalkVar, WalkCall.get(), /*DirectInit=*/false);
+    FinalizeDeclaration(WalkVar);
+    CurContext->addHiddenDecl(WalkVar);
+
+    DeclGroupPtrTy WalkGroup = BuildDeclaratorGroup(MutableArrayRef<Decl *>((Decl **)&WalkVar, 1));
+    WalkDecl = ActOnDeclStmt(WalkGroup, RangeLoc, RangeLoc);
+
+    // For CilkBeginWalk
+    DeclarationNameInfo BeginWalkDNI(
+    Context.DeclarationNames.getIdentifier(&PP.getIdentifierTable().get("CilkBeginWalk")),
+    RangeLoc);
+
+    ExprResult BeginWalkAccess = CXXDependentScopeMemberExpr::Create(
+    Context,
+    RangeRef.get(),
+    RangeVar->getType(),
+    /*IsArrow=*/false,
+    /*OpLoc=*/RangeLoc,
+    /*QualifierLoc=*/NestedNameSpecifierLoc(),
+    /*TemplateKWLoc=*/SourceLocation(),
+    /*FirstQualifierInScope=*/nullptr,
+    BeginWalkDNI,
+    /*TemplateArgs=*/nullptr);
+
+    // Create a dependent call expression for CilkBeginWalk
+    ExprResult BeginWalkCall = ActOnCallExpr(S, BeginWalkAccess.get(), RangeLoc,
+    /*args*/ {}, RangeLoc);
+
+    // Create BeginWalkVar with dependent type
+    VarDecl *BeginWalkVar = BuildForRangeVarDecl(*this, RangeLoc,
+        Context.DependentTy,
+        std::string("__cilk_begin_walk") + DepthStr);
+    AddInitializerToDecl(BeginWalkVar, BeginWalkCall.get(), /*DirectInit=*/false);
+    FinalizeDeclaration(BeginWalkVar);
+    CurContext->addHiddenDecl(BeginWalkVar);
+
+    DeclGroupPtrTy BeginWalkGroup =
+    BuildDeclaratorGroup(MutableArrayRef<Decl *>((Decl **)&BeginWalkVar, 1));
+    BeginWalkDecl = ActOnDeclStmt(BeginWalkGroup, RangeLoc, RangeLoc);
+
   } else {
+    // Non-dependent case - use the original implementation
     if (FinishForRangeVarDecl(*this, RangeVar, Range, RangeLoc,
-                            diag::err_for_range_deduction_failure)) {
+    diag::err_for_range_deduction_failure)) {
       std::cout << "ACT: error in FinishForRangeVarDecl" << std::endl;
       ActOnInitializerError(LoopVar);
       return StmtError();
     }
-  }
-  
-  // Create the range declaration statement
-  DeclGroupPtrTy RangeGroup =
-      BuildDeclaratorGroup(MutableArrayRef<Decl *>((Decl **)&RangeVar, 1));
-  StmtResult RangeDecl = ActOnDeclStmt(RangeGroup, RangeLoc, RangeLoc);
-  if (RangeDecl.isInvalid()) {
-    ActOnInitializerError(LoopVar);
-    std::cout << "ACT: error in create range declaration statement" << std::endl;
+
+    // Create the range declaration statement
+    DeclGroupPtrTy RangeGroup =
+    BuildDeclaratorGroup(MutableArrayRef<Decl *>((Decl **)&RangeVar, 1));
+    RangeDecl = ActOnDeclStmt(RangeGroup, RangeLoc, RangeLoc);
+    if (RangeDecl.isInvalid()) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: error in create range declaration statement" << std::endl;
     return StmtError();
+    }
+
+    ExprResult WalkMember = FindContainerWalkFunction(Range);
+    ExprResult BeginWalkMember = FindContainerBeginWalkFunction(Range);
+
+    if (WalkMember.isInvalid() || BeginWalkMember.isInvalid()) {
+      std::cout << "ACT: walk or begin is invalid" << std::endl;
+      ActOnInitializerError(LoopVar);
+      return StmtError();
+    }
+
+    // Build reference to RangeVar
+    ExprResult RangeRef = BuildDeclRefExpr(RangeVar, RangeVar->getType(),
+    VK_LValue, RangeLoc);
+    if (RangeRef.isInvalid()) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: rangeref is invalid" << std::endl;
+      return StmtError();
   }
 
-  ExprResult WalkMember = FindContainerWalkFunction(Range);
-  ExprResult BeginWalkMember = FindContainerBeginWalkFunction(Range);
-  
-  if (WalkMember.isInvalid() || BeginWalkMember.isInvalid()) {
-    std::cout << "ACT: walk or begin is invalid" << std::endl;
-    ActOnInitializerError(LoopVar);
-    return StmtError();
-  }
+    std::cout << "ACT: built declrefexpr" << std::endl;
+    CXXScopeSpec SS;
+    IdentifierInfo &WalkII = PP.getIdentifierTable().get("CilkWalk");
+    DeclarationName WalkName = Context.DeclarationNames.getIdentifier(&WalkII);
+    LookupResult WalkR(*this, WalkName, RangeLoc, LookupMemberName);
 
-  ExprResult RangeRef = BuildDeclRefExpr(RangeVar, RangeVar->getType(),
-                                      VK_LValue, RangeLoc);
-  if (RangeRef.isInvalid()) {
-    ActOnInitializerError(LoopVar);
-    std::cout << "ACT: rangeref is invalid" << std::endl;
-    return StmtError();
-  }
+    QualType RangeType = RangeVar->getType();
+    CXXRecordDecl *RangeClass = RangeType->getAsCXXRecordDecl();
+    if (!RangeClass) {
+      std::cout << "ACT: RangeClass is null for non-dependent type" << std::endl;
+      ActOnInitializerError(LoopVar);
+      return StmtError();
+    }
 
-  std::cout << "ACT: built declrefexpr" << std::endl;
-  CXXScopeSpec SS;
-  IdentifierInfo &WalkII = PP.getIdentifierTable().get("CilkWalk");
-  DeclarationName WalkName = Context.DeclarationNames.getIdentifier(&WalkII);
-  LookupResult WalkR(*this, WalkName, RangeLoc, LookupMemberName);
-  QualType RangeType = RangeVar->getType();
-  CXXRecordDecl *RangeClass = RangeType->getAsCXXRecordDecl();
-  LookupQualifiedName(WalkR, RangeClass);
+    LookupQualifiedName(WalkR, RangeClass);
 
-  ExprResult WalkAccess = BuildMemberReferenceExpr(
-      RangeRef.get(), RangeType, RangeLoc, 
-      /*IsArrow=*/false, SS, SourceLocation(),
-      /*FirstQualifierInScope=*/nullptr, WalkR,
-      /*TemplateArgs=*/nullptr, S,
-      /*SuppressQualifierCheck=*/false);
+    ExprResult WalkAccess = BuildMemberReferenceExpr(
+    RangeRef.get(), RangeType, RangeLoc, 
+    /*IsArrow=*/false, SS, SourceLocation(),
+    /*FirstQualifierInScope=*/nullptr, WalkR,
+    /*TemplateArgs=*/nullptr, S,
+    /*SuppressQualifierCheck=*/false);
 
-  if (WalkAccess.isInvalid()) {
-    std::cout << "ACT: WalkAccess is invalid" << std::endl;
-    ActOnInitializerError(LoopVar);
-    return StmtError();
-  }
+    if (WalkAccess.isInvalid()) {
+      std::cout << "ACT: WalkAccess is invalid" << std::endl;
+      ActOnInitializerError(LoopVar);
+      return StmtError();
+    }
 
-  ExprResult WalkCall = ActOnCallExpr(S, WalkAccess.get(), RangeLoc,
-                                    /*args*/ {}, RangeLoc);
-  if (WalkCall.isInvalid()) {
-    ActOnInitializerError(LoopVar);
-    std::cout << "ACT: WalkCall is invalid" << std::endl;
-    return StmtError();
-  }
+    ExprResult WalkCall = ActOnCallExpr(S, WalkAccess.get(), RangeLoc,
+    /*args*/ {}, RangeLoc);
+    if (WalkCall.isInvalid()) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: WalkCall is invalid" << std::endl;
+      return StmtError();
+    }
 
-  VarDecl *WalkVar = BuildForRangeVarDecl(*this, RangeLoc,
+    VarDecl *WalkVar = BuildForRangeVarDecl(*this, RangeLoc,
     Context.getAutoDeductType(),
     std::string("__cilk_walk") + DepthStr);
-  if (FinishForRangeVarDecl(*this, WalkVar, WalkCall.get(), RangeLoc,
-  diag::err_for_range_deduction_failure)) {
-    ActOnInitializerError(LoopVar);
-    std::cout << "ACT: for range deduction failure" << std::endl;
-    return StmtError();
+    if (FinishForRangeVarDecl(*this, WalkVar, WalkCall.get(), RangeLoc,
+      diag::err_for_range_deduction_failure)) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: for range deduction failure" << std::endl;
+      return StmtError();
+    }
+
+    DeclGroupPtrTy WalkGroup = BuildDeclaratorGroup(MutableArrayRef<Decl *>((Decl **)&WalkVar, 1));
+    WalkDecl = ActOnDeclStmt(WalkGroup, RangeLoc, RangeLoc);
+    if (WalkDecl.isInvalid()) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: walkDecl is invalid" << std::endl;
+      return StmtError();
+    }
+
+    IdentifierInfo &BeginWalkII = PP.getIdentifierTable().get("CilkBeginWalk");
+    DeclarationName BeginWalkName = Context.DeclarationNames.getIdentifier(&BeginWalkII);
+    LookupResult BeginWalkR(*this, BeginWalkName, RangeLoc, LookupMemberName);
+    LookupQualifiedName(BeginWalkR, RangeClass);
+
+    ExprResult BeginWalkAccess = BuildMemberReferenceExpr(
+    RangeRef.get(), RangeType, RangeLoc, 
+    /*IsArrow=*/false, SS, SourceLocation(),
+    /*FirstQualifierInScope=*/nullptr, BeginWalkR,
+    /*TemplateArgs=*/nullptr, S,
+    /*SuppressQualifierCheck=*/false);
+
+    if (BeginWalkAccess.isInvalid()) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: beginwalkaccess is invalid" << std::endl;
+      return StmtError();
+    }
+
+    ExprResult BeginWalkCall = ActOnCallExpr(S, BeginWalkAccess.get(), RangeLoc,
+    /*args*/ {}, RangeLoc);
+    if (BeginWalkCall.isInvalid()) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: beginwalkaccess is invalid" << std::endl;
+      return StmtError();
+    }
+
+    VarDecl *BeginWalkVar = BuildForRangeVarDecl(*this, RangeLoc,
+        Context.getAutoDeductType(),
+        std::string("__cilk_begin_walk") + DepthStr);
+    if (FinishForRangeVarDecl(*this, BeginWalkVar, BeginWalkCall.get(), RangeLoc,
+    diag::err_for_range_deduction_failure)) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: beginwalkvar is invalid" << std::endl;
+      return StmtError();
+    }
+
+    DeclGroupPtrTy BeginWalkGroup =
+    BuildDeclaratorGroup(MutableArrayRef<Decl *>((Decl **)&BeginWalkVar, 1));
+    BeginWalkDecl = ActOnDeclStmt(BeginWalkGroup, RangeLoc, RangeLoc);
+    if (BeginWalkDecl.isInvalid()) {
+      ActOnInitializerError(LoopVar);
+      std::cout << "ACT: beginWalkDecl is invalid" << std::endl;
+      return StmtError();
+    }
   }
 
-  DeclGroupPtrTy WalkGroup = BuildDeclaratorGroup(MutableArrayRef<Decl *>((Decl **)&WalkVar, 1));
-  StmtResult WalkDecl = ActOnDeclStmt(WalkGroup, RangeLoc, RangeLoc);
-  if (WalkDecl.isInvalid()) {
-    ActOnInitializerError(LoopVar);
-    std::cout << "ACT: walkDecl is invalid" << std::endl;
-    return StmtError();
-  }
-
-  IdentifierInfo &BeginWalkII = PP.getIdentifierTable().get("CilkBeginWalk");
-  DeclarationName BeginWalkName = Context.DeclarationNames.getIdentifier(&BeginWalkII);
-  LookupResult BeginWalkR(*this, BeginWalkName, RangeLoc, LookupMemberName);
-  LookupQualifiedName(BeginWalkR, RangeClass);
-
-  ExprResult BeginWalkAccess = BuildMemberReferenceExpr(
-      RangeRef.get(), RangeType, RangeLoc, 
-      /*IsArrow=*/false, SS, SourceLocation(),
-      /*FirstQualifierInScope=*/nullptr, BeginWalkR,
-      /*TemplateArgs=*/nullptr, S,
-      /*SuppressQualifierCheck=*/false);
-
-  if (BeginWalkAccess.isInvalid()) {
-    ActOnInitializerError(LoopVar);
-    std::cout << "ACT: beginwalkaccess is invalid" << std::endl;
-    return StmtError();
-  }
-
-  ExprResult BeginWalkCall = ActOnCallExpr(S, BeginWalkAccess.get(), RangeLoc,
-                                        /*args*/ {}, RangeLoc);
-  if (BeginWalkCall.isInvalid()) {
-    ActOnInitializerError(LoopVar);
-    std::cout << "ACT: beginwalkaccess is invalid" << std::endl;
-    return StmtError();
-  }
-
-  VarDecl *BeginWalkVar = BuildForRangeVarDecl(*this, RangeLoc,
-                                              Context.getAutoDeductType(),
-                                              std::string("__cilk_begin_walk") + DepthStr);
-  if (FinishForRangeVarDecl(*this, BeginWalkVar, BeginWalkCall.get(), RangeLoc,
-                          diag::err_for_range_deduction_failure)) {
-    ActOnInitializerError(LoopVar);
-    std::cout << "ACT: beginwalkvar is invalid" << std::endl;
-    return StmtError();
-  }
-
-  DeclGroupPtrTy BeginWalkGroup =
-      BuildDeclaratorGroup(MutableArrayRef<Decl *>((Decl **)&BeginWalkVar, 1));
-  StmtResult BeginWalkDecl = ActOnDeclStmt(BeginWalkGroup, RangeLoc, RangeLoc);
-  if (BeginWalkDecl.isInvalid()) {
-    ActOnInitializerError(LoopVar);
-    std::cout << "ACT: beginWalkDecl is invalid" << std::endl;
-    return StmtError();
-  }
-
+  // Create the final CilkForRangeWalkStmt regardless of whether we're dealing with
+  // dependent or non-dependent types
   CilkForRangeWalkStmt *ForRangeWalk = new (Context) CilkForRangeWalkStmt(
-                        cast<DeclStmt>(RangeDecl.get()), cast<DeclStmt>(BeginWalkDecl.get()), cast<DeclStmt>(WalkDecl.get()), 
-                        DS, /*Body=*/nullptr, ForLoc, SourceLocation(), 
-                        ColonLoc, RParenLoc);
+  cast<DeclStmt>(RangeDecl.get()), 
+  cast<DeclStmt>(BeginWalkDecl.get()), 
+  cast<DeclStmt>(WalkDecl.get()), 
+  DS, /*Body=*/nullptr, ForLoc, SourceLocation(), 
+  ColonLoc, RParenLoc);
   std::cout << "ACT: successfully returning" << std::endl;
   return ForRangeWalk;
-
 }
 
 StmtResult Sema::BuildCilkForRangeWalkStmt(CilkForRangeWalkStmt *ForRangeWalkStmt) {
