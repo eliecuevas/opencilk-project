@@ -168,6 +168,78 @@ public:
   child_range children() { return child_range(&SubExprs[0], &SubExprs[END]); }
 };
 
+class CilkForRangeWalkStmt : public Stmt {
+  SourceLocation ForLoc;
+  enum {
+    // COND assumed to be LOOPVAR != null
+    WALKSTMT,
+    BEGINWALKSTMT,
+    LOOPVAR,
+    RANGE,
+    BODY,
+    END
+  };
+  Stmt *SubExprs[END];
+  SourceLocation ColonLoc;
+  SourceLocation RParenLoc;
+  friend class ASTStmtReader;
+public:
+  CilkForRangeWalkStmt(DeclStmt *Range, DeclStmt *BeginWalk,
+    DeclStmt *Walk, DeclStmt *LoopVar,
+    Stmt *Body, SourceLocation FL, SourceLocation CAL,
+    SourceLocation CL, SourceLocation RPL);
+  CilkForRangeWalkStmt(EmptyShell Empty) : Stmt(CilkForRangeWalkStmtClass, Empty) { }
+
+  VarDecl *getLoopVariable();
+  Expr *getRangeInit();
+  const VarDecl *getLoopVariable() const;
+  const Expr *getRangeInit() const;
+
+  DeclStmt *getBeginWalkStmt() { return cast_or_null<DeclStmt>(SubExprs[BEGINWALKSTMT]); }
+  DeclStmt *getWalkStmt() { return cast_or_null<DeclStmt>(SubExprs[WALKSTMT]); }
+  DeclStmt *getLoopVarStmt() { return cast<DeclStmt>(SubExprs[LOOPVAR]); }
+  DeclStmt *getRangeStmt() { return cast<DeclStmt>(SubExprs[RANGE]); }
+  Stmt *getBody() { return SubExprs[BODY]; }
+
+  const DeclStmt *getWalkStmt() const {
+    return cast_or_null<DeclStmt>(SubExprs[WALKSTMT]);
+  }
+  const DeclStmt *getBeginWalkStmt() const {
+    return cast_or_null<DeclStmt>(SubExprs[BEGINWALKSTMT]);
+  }
+  const DeclStmt *getLoopVarStmt() const {
+    return cast<DeclStmt>(SubExprs[LOOPVAR]);
+  }
+  const DeclStmt *getRangeStmt() const {
+    return cast<DeclStmt>(SubExprs[RANGE]);
+  }
+  const Stmt *getBody() const { return SubExprs[BODY]; }
+  
+  void setWalkStmt(Stmt *S) { SubExprs[WALKSTMT] = S; }
+  void setBeginWalkStmt(Stmt *S) { SubExprs[BEGINWALKSTMT] = S; }
+  void setLoopVarStmt(Stmt *S) { SubExprs[LOOPVAR] = S; }
+  void setRangeInit(Expr *E) { SubExprs[RANGE] = reinterpret_cast<Stmt*>(E); }
+  void setRangeStmt(Stmt *S) { SubExprs[RANGE] = S; }
+  void setBody(Stmt *S) { SubExprs[BODY] = S; }
+
+  SourceLocation getForLoc() const { return ForLoc; }
+  SourceLocation getColonLoc() const { return ColonLoc; }
+  SourceLocation getRParenLoc() const { return RParenLoc; }
+
+  SourceLocation getBeginLoc() const LLVM_READONLY { return ForLoc; }
+  SourceLocation getEndLoc() const LLVM_READONLY {
+    return SubExprs[BODY]->getEndLoc();
+  }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == CilkForRangeWalkStmtClass;
+  }
+  child_range children() { return child_range(&SubExprs[0], &SubExprs[END]); }
+  const_child_range children() const {
+    return const_child_range(&SubExprs[0], &SubExprs[END]);
+  }
+};
+
 /// CilkForStmt - This represents a '_Cilk_for(init;cond;inc)' stmt.
 class CilkForStmt : public Stmt {
   SourceLocation CilkForLoc;

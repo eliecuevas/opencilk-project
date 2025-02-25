@@ -2298,6 +2298,10 @@ void StmtProfiler::VisitCilkForRangeStmt(const CilkForRangeStmt *S) {
   VisitStmt(S);
 }
 
+void StmtProfiler::VisitCilkForRangeWalkStmt(const CilkForRangeWalkStmt *S) {
+  VisitStmt(S);
+}
+
 void StmtProfiler::VisitOpaqueValueExpr(const OpaqueValueExpr *E) {
   VisitExpr(E);
 }

@@ -1481,3 +1481,37 @@ Stmt *CilkForStmt::getOriginalInit() {
 const Stmt *CilkForStmt::getOriginalInit() const {
   return const_cast<CilkForStmt *>(this)->getOriginalInit();
 }
+
+CilkForRangeWalkStmt::CilkForRangeWalkStmt(DeclStmt *Range, DeclStmt *BeginWalk,
+  DeclStmt *Walk, DeclStmt *LoopVar,
+  Stmt *Body, SourceLocation FL, SourceLocation CAL,
+  SourceLocation CL, SourceLocation RPL) : Stmt(CilkForRangeWalkStmtClass),
+  ForLoc(FL), ColonLoc(CL), RParenLoc(RPL)
+  {
+    SubExprs[WALKSTMT] = Walk;
+    SubExprs[BEGINWALKSTMT] = BeginWalk;
+    SubExprs[LOOPVAR] = LoopVar;
+    SubExprs[RANGE] = Range;
+    SubExprs[BODY] = Body;
+}
+
+VarDecl *CilkForRangeWalkStmt::getLoopVariable() {
+  Decl *LV = cast<DeclStmt>(getLoopVarStmt())->getSingleDecl();
+  assert(LV && "No simple loop variable in CilkForRangeWalkStmt");
+  return cast<VarDecl>(LV);
+}
+
+const VarDecl *CilkForRangeWalkStmt::getLoopVariable() const {
+  return const_cast<CilkForRangeWalkStmt *>(this)->getLoopVariable();
+}
+
+Expr *CilkForRangeWalkStmt::getRangeInit() {
+  DeclStmt *RangeStmt = getRangeStmt();
+  VarDecl *RangeDecl = dyn_cast_or_null<VarDecl>(RangeStmt->getSingleDecl());
+  assert(RangeDecl && "cilk-for-range-walk should have a single var decl");
+  return RangeDecl->getInit();
+}
+
+const Expr *CilkForRangeWalkStmt::getRangeInit() const {
+  return const_cast<CilkForRangeWalkStmt *>(this)->getRangeInit();
+}

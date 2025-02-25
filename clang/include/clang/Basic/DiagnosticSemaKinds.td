@@ -10923,7 +10923,10 @@ def no_reducer_array : Warning<
 // cilk for_range
 def err_cilk_for_range_end_minus_begin : Error<
   "Cannot determine length with '__end - __begin'. Please use a random access iterator.">;
-} 
+
+def err_cilk_for_range_walk_no_objc : Error<
+"Cilk for-range loops using the walk function cannot be in Objective C.">;
+}
 // end of Cilk category
 
 let CategoryName = "OpenMP Issue" in {

@@ -1490,6 +1490,11 @@ public:
     return getSema().FinishCilkForRangeStmt(ForRange, Body);
   }
 
+  // imma keep it real w u chief i'm confused
+  StmtResult RebuildCilkForRangeWalkStmt(Stmt *ForRangeWalk) {
+    return getSema().BuildCilkForRangeWalkStmt(cast_or_null<CilkForRangeWalkStmt>(ForRangeWalk));                                    
+  }
+
 
   /// Build a new goto statement.
   ///
@@ -15722,6 +15727,12 @@ TreeTransform<Derived>::TransformCilkForRangeStmt(CilkForRangeStmt *S) {
 
   return getDerived().FinishCilkForRangeStmt(
       CilkForRange.get(), cast<CXXForRangeStmt>(ForRange.get())->getBody());
+}
+
+template<typename Derived>
+StmtResult
+TreeTransform<Derived>::TransformCilkForRangeWalkStmt(CilkForRangeWalkStmt *S) {
+  return getDerived().RebuildCilkForRangeWalkStmt(S);
 }
 
 } // end namespace clang

@@ -1300,7 +1300,6 @@ CanThrowResult Sema::canThrow(const Stmt *S) {
   case Expr::VAArgExprClass:
   case Expr::CXXParenListInitExprClass:
   case Expr::CilkSpawnExprClass:
-  case Stmt::CilkForRangeStmtClass:
     return canSubStmtsThrow(*this, S);
 
   case Expr::CompoundLiteralExprClass:
@@ -1533,6 +1532,8 @@ CanThrowResult Sema::canThrow(const Stmt *S) {
   case Stmt::CilkSyncStmtClass:
   case Stmt::CilkForStmtClass:
   case Stmt::CilkScopeStmtClass:
+  case Stmt::CilkForRangeStmtClass:
+  case Stmt::CilkForRangeWalkStmtClass:
     return canSubStmtsThrow(*this, S);
 
   case Stmt::DeclStmtClass: {

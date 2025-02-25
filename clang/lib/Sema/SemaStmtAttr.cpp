@@ -89,7 +89,8 @@ static Attr *handleLoopHintAttr(Sema &S, Stmt *St, const ParsedAttr &A,
 
   if ((PragmaName == "cilk") &&
       (St->getStmtClass() != Stmt::CilkForStmtClass &&
-       St->getStmtClass() != Stmt::CilkForRangeStmtClass)) {
+       St->getStmtClass() != Stmt::CilkForRangeStmtClass &&
+      St->getStmtClass() != Stmt::CilkForRangeWalkStmtClass)) {
     S.Diag(St->getBeginLoc(), diag::err_pragma_cilk_precedes_noncilk)
       << "#pragma cilk";
     return nullptr;
@@ -98,7 +99,7 @@ static Attr *handleLoopHintAttr(Sema &S, Stmt *St, const ParsedAttr &A,
   // This could be handled automatically by adding a Subjects definition in
   // Attr.td, but that would make the diagnostic behavior worse in this case
   // because the user spells this attribute as a pragma.
-  if (!isa<DoStmt, ForStmt, CXXForRangeStmt, WhileStmt, CilkForStmt, CilkForRangeStmt>(St)) {
+  if (!isa<DoStmt, ForStmt, CXXForRangeStmt, WhileStmt, CilkForStmt, CilkForRangeStmt, CilkForRangeWalkStmt>(St)) {
     std::string Pragma = "#pragma " + std::string(PragmaName);
     S.Diag(St->getBeginLoc(), diag::err_pragma_loop_precedes_nonloop) << Pragma;
     return nullptr;

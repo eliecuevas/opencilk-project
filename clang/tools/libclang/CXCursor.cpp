@@ -317,6 +317,10 @@ CXCursor cxcursor::MakeCXCursor(const Stmt *S, const Decl *Parent,
     K = CXCursor_CilkForRangeStmt;
     break;
 
+  case Stmt::CilkForRangeWalkStmtClass:
+    K = CXCursor_CilkForRangeWalkStmt;
+    break;
+
   case Stmt::ArrayTypeTraitExprClass:
   case Stmt::AsTypeExprClass:
   case Stmt::AtomicExprClass:

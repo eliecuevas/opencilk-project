@@ -2324,6 +2324,19 @@ void ASTStmtWriter::VisitCilkForRangeStmt(CilkForRangeStmt *S) {
   Code = serialization::STMT_CILKFORRANGE;
 }
 
+void ASTStmtWriter::VisitCilkForRangeWalkStmt(CilkForRangeWalkStmt *S) {
+  VisitStmt(S);
+  Record.AddStmt(S->getWalkStmt());
+  Record.AddStmt(S->getBeginWalkStmt());
+  Record.AddStmt(S->getLoopVarStmt());
+  Record.AddStmt(S->getRangeStmt());
+  Record.AddStmt(S->getBody());
+  Record.AddSourceLocation(S->getForLoc());
+  Record.AddSourceLocation(S->getColonLoc());
+  Record.AddSourceLocation(S->getRParenLoc());
+  Code = serialization::STMT_CILKFORRANGEWALK;
+}
+
 //===----------------------------------------------------------------------===//
 // Microsoft Expressions and Statements.
 //===----------------------------------------------------------------------===//

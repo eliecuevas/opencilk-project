@@ -2881,6 +2881,7 @@ DEF_TRAVERSE_STMT(CilkForStmt, {
 })
 DEF_TRAVERSE_STMT(CilkScopeStmt, {})
 DEF_TRAVERSE_STMT(CilkForRangeStmt, {})
+DEF_TRAVERSE_STMT(CilkForRangeWalkStmt, {})
 
 // These operators (all of them) do not need any action except
 // iterating over the children.

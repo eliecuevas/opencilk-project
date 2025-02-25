@@ -2022,6 +2022,7 @@ enum StmtCode {
   STMT_CILKFOR,
   STMT_CILKSCOPE,
   STMT_CILKFORRANGE,
+  STMT_CILKFORRANGEWALK,
 };
 
 /// The kinds of designators that can occur in a

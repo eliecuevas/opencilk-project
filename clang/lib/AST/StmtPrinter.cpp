@@ -2834,6 +2834,20 @@ void StmtPrinter::VisitCilkForRangeStmt(CilkForRangeStmt *Node) {
   PrintControlledStmt(Node->getCXXForRangeStmt()->getBody());
 }
 
+void StmtPrinter::VisitCilkForRangeWalkStmt(CilkForRangeWalkStmt *Node) {
+  Indent() << "_Cilk_for (";
+
+  PrintingPolicy SubPolicy(Policy);
+  SubPolicy.SuppressInitializers = true;
+  Node->getLoopVariable()->print(OS, SubPolicy,IndentLevel);
+
+  OS << " : ";
+  PrintExpr(Node->getRangeInit());
+  OS << ")";
+
+  PrintControlledStmt(Node->getBody());
+}
+
 //===----------------------------------------------------------------------===//
 // Stmt method implementations
 //===----------------------------------------------------------------------===//

@@ -2824,6 +2824,18 @@ void ASTStmtReader::VisitCilkForRangeStmt(CilkForRangeStmt *S) {
   S->setForRange(Record.readSubStmt());
 }
 
+void ASTStmtReader::VisitCilkForRangeWalkStmt(CilkForRangeWalkStmt *S){
+  VisitStmt(S);
+  S->setWalkStmt(Record.readSubStmt());
+  S->setBeginWalkStmt(Record.readSubStmt());
+  S->setLoopVarStmt(Record.readSubStmt());
+  S->setRangeStmt(Record.readSubStmt());
+  S->setBody(Record.readSubStmt());
+  S->ForLoc = readSourceLocation();
+  S->ColonLoc = readSourceLocation();
+  S->RParenLoc = readSourceLocation();
+}
+
 //===----------------------------------------------------------------------===//
 // ASTReader Implementation
 //===----------------------------------------------------------------------===//
@@ -3052,6 +3064,9 @@ Stmt *ASTReader::ReadStmtFromStream(ModuleFile &F) {
       S = new (Context) CilkForRangeStmt(Empty);
       break;
 
+    case STMT_CILKFORRANGEWALK:
+      S = new (Context) CilkForRangeWalkStmt(Empty);
+      break;
     case EXPR_PREDEFINED:
       S = PredefinedExpr::CreateEmpty(
           Context,

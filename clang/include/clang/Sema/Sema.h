@@ -5337,7 +5337,15 @@ public:
                                    SourceLocation ColonLoc, Expr *Range,
                                    SourceLocation RParenLoc,
                                    BuildForRangeKind Kind);
+  StmtResult ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
+                                    Stmt *InitStmt, Stmt *First,
+                                    SourceLocation ColonLoc, Expr *Range,
+                                    SourceLocation RParenLoc,
+                                    BuildForRangeKind Kind);
   StmtResult BuildCilkForRangeStmt(CXXForRangeStmt *S);
+  StmtResult BuildCilkForRangeWalkStmt(CilkForRangeWalkStmt *ForRangeWalkStmt);
+  ExprResult FindContainerWalkFunction(Expr *Container);
+  ExprResult FindContainerBeginWalkFunction(Expr *Container);
   StmtResult FinishCilkForRangeStmt(Stmt *S, Stmt *B);
   StmtResult BuildCilkForStmt(SourceLocation CilkForLoc,
                               SourceLocation LParenLoc,
