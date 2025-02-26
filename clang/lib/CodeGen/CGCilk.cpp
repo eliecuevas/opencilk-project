@@ -786,70 +786,88 @@ CodeGenFunction::EmitCilkForRangeStmt(const CilkForRangeStmt &S,
 }
 
 void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S) {
-  std::cout << "EMIT: entering emit cilkForRangeWalkStmt" << std::endl;
-  // Get the begin walk variable
-  const VarDecl *BeginWalkVar = cast<VarDecl>(S.getBeginWalkStmt()->getSingleDecl());
-  
-  std::cout << "EMIT: got beginwalkvar" << std::endl;
-
-  // Create the basic blocks for the loop
+  std::cout << "EMIT: entering emit" << std::endl;
+  // Create the basic blocks for the loop structure
   JumpDest LoopExit = getJumpDestInCurrentScope("cilk.for.end");
   JumpDest LoopCond = getJumpDestInCurrentScope("cilk.for.cond");
   JumpDest LoopBody = getJumpDestInCurrentScope("cilk.for.body");
+  JumpDest LoopIncrement = getJumpDestInCurrentScope("cilk.for.inc");
   
-  // Get the range variable
-  const VarDecl *RangeVar = cast<VarDecl>(S.getRangeStmt()->getSingleDecl());
-  const VarDecl *LoopVar = cast<VarDecl>(S.getLoopVarStmt()->getSingleDecl());
-  
-  std::cout << "EMIT: cased" << std::endl;
-
-
-  // Emit the range and begin walk variable declarations
+  // Emit the variable declarations first
   EmitStmt(S.getRangeStmt());
   EmitStmt(S.getBeginWalkStmt());
+  EmitStmt(S.getWalkStmt());
   
-  // Initial check - if beginWalk is null, skip the loop
-  // Create a DeclRefExpr for the BeginWalkVar
-  auto BeginWalkDRE = DeclRefExpr::Create(
-    getContext(),                          // ASTContext
-    NestedNameSpecifierLoc(),              // QualifierLoc
-    SourceLocation(),                      // TemplateKWLoc
-    const_cast<VarDecl*>(BeginWalkVar),    // Decl
-    false,                                 // RefersToEnclosingVariableOrCapture
-    SourceLocation(),                      // NameLoc
-    BeginWalkVar->getType(),               // Type
-    VK_LValue                              // ValueKind
-  );
-
-  // Now emit the reference and get the pointer
-  llvm::Value *BeginWalkAddr = EmitDeclRefLValue(BeginWalkDRE).getPointer(*this);
-  llvm::Value *IsBeginWalkNull = Builder.CreateIsNull(BeginWalkAddr);
+  // Get our DeclRefExpr nodes from the statement
+  Expr *BeginWalkRef = S.getBeginWalkRef();
+  Expr *WalkRef = S.getWalkRef();
+  Expr *LoopVarRef = S.getLoopVarRef();
+  
+  // Initial check - if beginWalk returns null, we skip the loop entirely
+  LValue BeginWalkLV = EmitLValue(BeginWalkRef);
+  llvm::Value *BeginWalkPtr = BeginWalkLV.getPointer(*this);
+  llvm::Value *IsBeginWalkNull = Builder.CreateIsNull(BeginWalkPtr);
   Builder.CreateCondBr(IsBeginWalkNull, LoopExit.getBlock(), LoopCond.getBlock());
-  
-  // Loop condition - check if the current node is null
+  std::cout << "EMIT: created first condbr" << std::endl;
+  // Loop condition block - initialize the loop variable from the current node
   EmitBlock(LoopCond.getBlock());
+  EmitStmt(S.getLoopVarStmt());  // This initializes LoopVar from BeginWalkVar
   
-  // Dereference the begin walk to get the current node
-  // This will be used to initialize the loop variable
-  EmitStmt(S.getLoopVarStmt());
-  
-  // Emit the body of the loop
+  // Loop body
   EmitBlock(LoopBody.getBlock());
   EmitStmt(S.getBody());
+  Builder.CreateBr(LoopIncrement.getBlock());
+  std::cout << "EMIT: created br" << std::endl;
+  // Loop increment - call CilkWalk to advance to the next node
+  EmitBlock(LoopIncrement.getBlock());
   
-  // This is where the magic would happen
-  // We'd need to wrap the body in a lambda and pass it to walk
-  // The LLVM pass will handle this transformation later
+  // First, get the current node from the loop variable
+  LValue LoopVarLV = EmitLValue(LoopVarRef);
+  llvm::Value *CurrentNodePtr = LoopVarLV.getPointer(*this);
+  std::cout << "EMIT: got loopvar ptr" << std::endl;
+  // Get the CilkWalk function from WalkRef
+  LValue WalkLV = EmitLValue(WalkRef);
+  llvm::Value *WalkFnPtr = WalkLV.getPointer(*this);
+  std::cout << "EMIT: got walk ptr" << std::endl;
+  // Create a call to CilkWalk with the current node as argument
+  // This is a "faux" call that will be transformed by the LLVM pass
+  llvm::Type *WalkFnType = WalkFnPtr->getType();
   
-  // Emit code to advance to the next node (handled by CilkWalk)
-  // For now, we'll just jump back to the condition
-  Builder.CreateBr(LoopCond.getBlock());
+  // We need to create a function type for the call
+  // Assuming it's something like Node* (Node*)
+  llvm::Type *NodePtrTy = CurrentNodePtr->getType();
+  llvm::Type *ReturnTy = NodePtrTy;  // Return type is the same as the argument
+  llvm::Type *ArgTypes[] = {NodePtrTy};
   
+  // Create a function type for the call
+  llvm::FunctionType *FnTy = llvm::FunctionType::get(ReturnTy, ArgTypes, false);
+  std::cout << "EMIT: created function type" << std::endl;
+  // Cast the function pointer to the right type if needed
+  llvm::Value *CastedFnPtr = WalkFnPtr;
+  if (WalkFnPtr->getType() != llvm::PointerType::getUnqual(FnTy)) {
+    CastedFnPtr = Builder.CreateBitCast(WalkFnPtr, 
+                                       llvm::PointerType::getUnqual(FnTy));
+  }
+  std::cout << "EMIT: casted function pointer" << std::endl;
+  // Create the call instruction
+  llvm::Value *Args[] = {CurrentNodePtr};
+  llvm::CallInst *WalkCall = Builder.CreateCall(FnTy, CastedFnPtr, Args);
+  std::cout << "EMIT: created call" << std::endl;
+  // Add metadata to identify this as a cilk_walk call for the LLVM pass
+  llvm::MDNode *MD = llvm::MDNode::get(getLLVMContext(), {});
+  WalkCall->setMetadata("cilk.walk", MD);
+  std::cout << "EMIT: set metadata" << std::endl;
+  // Store the result back to BeginWalkVar for the next iteration
+  // Address BeginWalkAddr = BeginWalkLV.getAddress(*this);
+  // Builder.CreateStore(WalkCall, BeginWalkAddr.getPointer());
+  
+  // Check if the result is null to determine whether to continue
+  llvm::Value *IsNextNodeNull = Builder.CreateIsNull(WalkCall);
+  Builder.CreateCondBr(IsNextNodeNull, LoopExit.getBlock(), LoopCond.getBlock());
+  std::cout << "EMIT: built final condbr" << std::endl;
   // Emit the exit block
   EmitBlock(LoopExit.getBlock());
-
-  std::cout << "EMIT: exiting successfully" << std:endl;
-
+  std::cout << "EMIT: success, returning" << std::endl;
 }
 
 

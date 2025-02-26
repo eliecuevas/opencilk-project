@@ -4054,10 +4054,13 @@ StmtResult Sema::FinishCilkForRangeWalkStmt(Stmt *S, Stmt *B) {
   // Get the loop variable declaration
   VarDecl *LoopVar = cast<VarDecl>(CilkForRangeWalk->getLoopVarStmt()->getSingleDecl());
   
-  // Get the BeginWalk variable
+  // Get the BeginWalk and Walk variable
   VarDecl *BeginWalkVar = cast<VarDecl>(
       CilkForRangeWalk->getBeginWalkStmt()->getSingleDecl());
   
+  VarDecl *WalkVar = cast<VarDecl>(CilkForRangeWalk->getWalkStmt()->getSingleDecl());
+
+
   // Check if we're dealing with a dependent type
   QualType BeginWalkType = BeginWalkVar->getType();
   bool isDependent = BeginWalkType->isDependentType();
@@ -4141,11 +4144,28 @@ StmtResult Sema::FinishCilkForRangeWalkStmt(Stmt *S, Stmt *B) {
           << LoopVar->getBeginLoc() << 1 << BeginWalkRef.get()->getType();
       return StmtError();
     }
-    
+
     // Initialize the loop variable with the dereferenced value
     AddInitializerToDecl(LoopVar, DerefExpr.get(), /*DirectInit=*/false);
   }
   
+  std::cout << "FINISH: Finished dependent/non-dependent specific" << std::endl;
+
+  // Create DeclRefExpr nodes
+  ExprResult LoopVarRef = BuildDeclRefExpr(LoopVar, LoopVar->getType().getNonReferenceType(), VK_LValue, SourceLocation());
+  ExprResult BeginWalkRef = BuildDeclRefExpr(BeginWalkVar, BeginWalkVar->getType().getNonReferenceType(), VK_LValue, SourceLocation());
+  ExprResult WalkRef = BuildDeclRefExpr(WalkVar, WalkVar->getType().getNonReferenceType(), VK_LValue, SourceLocation());
+  
+  std::cout << "FINISH: Finished building ref exprs" << std::endl;
+
+
+  // Store them in the statement
+  if (!LoopVarRef.isInvalid() && !BeginWalkRef.isInvalid() && !WalkRef.isInvalid()) {
+    CilkForRangeWalk->setLoopVarRef(LoopVarRef.get());
+    CilkForRangeWalk->setBeginWalkRef(BeginWalkRef.get());
+    CilkForRangeWalk->setWalkRef(WalkRef.get());
+  }
+  std::cout << "FINISH: created reference variables" << std::endl;
   std::cout << "FINISH: Successfully completed FinishCilkForRangeWalkStmt" << std::endl;
   
   return CilkForRangeWalk;

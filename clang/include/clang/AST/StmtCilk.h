@@ -183,6 +183,9 @@ class CilkForRangeWalkStmt : public Stmt {
   SourceLocation ColonLoc;
   SourceLocation RParenLoc;
   friend class ASTStmtReader;
+  Expr *BeginWalkRef;
+  Expr *WalkRef;
+  Expr *LoopVarRef;
 public:
   CilkForRangeWalkStmt(DeclStmt *Range, DeclStmt *BeginWalk,
     DeclStmt *Walk, DeclStmt *LoopVar,
@@ -194,6 +197,14 @@ public:
   Expr *getRangeInit();
   const VarDecl *getLoopVariable() const;
   const Expr *getRangeInit() const;
+
+  Expr *getBeginWalkRef() const { return BeginWalkRef; }
+  Expr *getWalkRef() const { return WalkRef; }
+  Expr *getLoopVarRef() const { return LoopVarRef; }
+  
+  void setBeginWalkRef(Expr *E) { BeginWalkRef = E; }
+  void setWalkRef(Expr *E) { WalkRef = E; }
+  void setLoopVarRef(Expr *E) { LoopVarRef = E; }
 
   DeclStmt *getBeginWalkStmt() { return cast_or_null<DeclStmt>(SubExprs[BEGINWALKSTMT]); }
   DeclStmt *getWalkStmt() { return cast_or_null<DeclStmt>(SubExprs[WALKSTMT]); }
