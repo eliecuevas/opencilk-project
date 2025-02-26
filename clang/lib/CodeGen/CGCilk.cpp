@@ -15,6 +15,7 @@
 #include "CGCleanup.h"
 #include "clang/AST/ExprCilk.h"
 #include "clang/AST/StmtCilk.h"
+#include <iostream>
 
 using namespace clang;
 using namespace CodeGen;
@@ -783,6 +784,74 @@ CodeGenFunction::EmitCilkForRangeStmt(const CilkForRangeStmt &S,
   if (TempInvokeDest->use_empty())
     delete TempInvokeDest;
 }
+
+void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S) {
+  std::cout << "EMIT: entering emit cilkForRangeWalkStmt" << std::endl;
+  // Get the begin walk variable
+  const VarDecl *BeginWalkVar = cast<VarDecl>(S.getBeginWalkStmt()->getSingleDecl());
+  
+  std::cout << "EMIT: got beginwalkvar" << std::endl;
+
+  // Create the basic blocks for the loop
+  JumpDest LoopExit = getJumpDestInCurrentScope("cilk.for.end");
+  JumpDest LoopCond = getJumpDestInCurrentScope("cilk.for.cond");
+  JumpDest LoopBody = getJumpDestInCurrentScope("cilk.for.body");
+  
+  // Get the range variable
+  const VarDecl *RangeVar = cast<VarDecl>(S.getRangeStmt()->getSingleDecl());
+  const VarDecl *LoopVar = cast<VarDecl>(S.getLoopVarStmt()->getSingleDecl());
+  
+  std::cout << "EMIT: cased" << std::endl;
+
+
+  // Emit the range and begin walk variable declarations
+  EmitStmt(S.getRangeStmt());
+  EmitStmt(S.getBeginWalkStmt());
+  
+  // Initial check - if beginWalk is null, skip the loop
+  // Create a DeclRefExpr for the BeginWalkVar
+  auto BeginWalkDRE = DeclRefExpr::Create(
+    getContext(),                          // ASTContext
+    NestedNameSpecifierLoc(),              // QualifierLoc
+    SourceLocation(),                      // TemplateKWLoc
+    const_cast<VarDecl*>(BeginWalkVar),    // Decl
+    false,                                 // RefersToEnclosingVariableOrCapture
+    SourceLocation(),                      // NameLoc
+    BeginWalkVar->getType(),               // Type
+    VK_LValue                              // ValueKind
+  );
+
+  // Now emit the reference and get the pointer
+  llvm::Value *BeginWalkAddr = EmitDeclRefLValue(BeginWalkDRE).getPointer(*this);
+  llvm::Value *IsBeginWalkNull = Builder.CreateIsNull(BeginWalkAddr);
+  Builder.CreateCondBr(IsBeginWalkNull, LoopExit.getBlock(), LoopCond.getBlock());
+  
+  // Loop condition - check if the current node is null
+  EmitBlock(LoopCond.getBlock());
+  
+  // Dereference the begin walk to get the current node
+  // This will be used to initialize the loop variable
+  EmitStmt(S.getLoopVarStmt());
+  
+  // Emit the body of the loop
+  EmitBlock(LoopBody.getBlock());
+  EmitStmt(S.getBody());
+  
+  // This is where the magic would happen
+  // We'd need to wrap the body in a lambda and pass it to walk
+  // The LLVM pass will handle this transformation later
+  
+  // Emit code to advance to the next node (handled by CilkWalk)
+  // For now, we'll just jump back to the condition
+  Builder.CreateBr(LoopCond.getBlock());
+  
+  // Emit the exit block
+  EmitBlock(LoopExit.getBlock());
+
+  std::cout << "EMIT: exiting successfully" << std:endl;
+
+}
+
 
 static const Stmt *IgnoreImplicitAndCleanups(const Stmt *S) {
   const Stmt *Current = S;
