@@ -3921,7 +3921,8 @@ public:
                        ArrayRef<const Attr *> Attrs = std::nullopt);
   void EmitCilkForRangeStmt(const CilkForRangeStmt &S,
                        ArrayRef<const Attr *> Attrs = std::nullopt);
-  void EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S);
+  void EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S,
+                        ArrayRef<const Attr *> Attrs = std::nullopt);
   LValue EmitCilkSpawnExprLValue(const CilkSpawnExpr *E);
 
   void EmitObjCForCollectionStmt(const ObjCForCollectionStmt &S);

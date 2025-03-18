@@ -52,7 +52,7 @@
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/TapirUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
-
+#include <iostream>
 #include <utility>
 
 using namespace llvm;
@@ -948,6 +948,7 @@ Task *LoopSpawningImpl::getTaskIfTapirLoop(const Loop *L) {
   }
 
   if (!isa<BranchInst>(Preheader->getTerminator())) {
+    std::cout << "Loop preheader is not terminated by a branch" << std::endl;
     LLVM_DEBUG(dbgs() << "Loop preheader is not terminated by a branch.\n");
     if (hintsDemandOutlining(Hints)) {
       ORE.emit(TapirLoopInfo::createMissedAnalysis(LS_NAME, "ComplexPreheader",
@@ -1668,15 +1669,19 @@ TaskOutlineMapTy LoopSpawningImpl::outlineAllTapirLoops() {
 }
 
 bool LoopSpawningImpl::run() {
-  if (TI.isSerial())
+  if (TI.isSerial()){
+    std::cout << "serial my boy" << std::endl;
     return false;
+  }
 
   // Discover all Tapir loops and record them.
-  for (Loop *TopLevelLoop : LI)
+  for (Loop *TopLevelLoop : LI) {
+    std::cout << "found a loop!" << std::endl;
     for (Loop *L : post_order(TopLevelLoop))
       if (Task *T = getTaskIfTapirLoop(L))
         createTapirLoop(L, T);
-
+  }
+      
   if (TapirLoops.empty())
     return false;
 

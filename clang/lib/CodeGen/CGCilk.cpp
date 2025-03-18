@@ -785,7 +785,8 @@ CodeGenFunction::EmitCilkForRangeStmt(const CilkForRangeStmt &S,
     delete TempInvokeDest;
 }
 
-void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S) {
+void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S, 
+                                                  ArrayRef<const Attr *> ForAttrs) {
   std::cout << "EMIT: entering emit" << std::endl;
   // Create the basic blocks for the loop structure
   JumpDest LoopExit = getJumpDestInCurrentScope("cilk.for.end");
@@ -821,6 +822,13 @@ void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S) {
   // Loop increment - call CilkWalk to advance to the next node
   EmitBlock(LoopIncrement.getBlock());
   
+
+  LoopStack.setSpawnStrategy(LoopAttributes::Walk);
+  const SourceRange &R = S.getSourceRange();
+  LoopStack.push(LoopCond.getBlock(), CGM.getContext(), CGM.getCodeGenOpts(), ForAttrs,
+                 SourceLocToDebugLoc(R.getBegin()),
+                 SourceLocToDebugLoc(R.getEnd()));
+
   // First, get the current node from the loop variable
   LValue LoopVarLV = EmitLValue(LoopVarRef);
   llvm::Value *CurrentNodePtr = LoopVarLV.getPointer(*this);
@@ -865,6 +873,7 @@ void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S) {
   llvm::Value *IsNextNodeNull = Builder.CreateIsNull(WalkCall);
   Builder.CreateCondBr(IsNextNodeNull, LoopExit.getBlock(), LoopCond.getBlock());
   std::cout << "EMIT: built final condbr" << std::endl;
+  LoopStack.pop();
   // Emit the exit block
   EmitBlock(LoopExit.getBlock());
   std::cout << "EMIT: success, returning" << std::endl;
