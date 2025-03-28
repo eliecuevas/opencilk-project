@@ -796,7 +796,40 @@ void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S,
   
   // Emit the variable declarations first
   EmitStmt(S.getRangeStmt());
+  llvm::BasicBlock *SavedBlock = Builder.GetInsertBlock();
   EmitStmt(S.getBeginWalkStmt());
+  llvm::BasicBlock *CurBlock = Builder.GetInsertBlock();
+  llvm::Instruction *FoundCall = nullptr;
+  if (SavedBlock != CurBlock) {
+  // Possibly the call ended the block with an 'invoke' or a 'br'.
+  // The insertion block changed, so your call is probably in SavedBlock.
+    if (!SavedBlock->empty()) {
+      if (auto *CB = dyn_cast<llvm::CallBase>(&SavedBlock->back())) {
+        if (llvm::Function *F = CB->getCalledFunction()) {
+          if (F->getName().contains("CilkBeginWalk")) {
+            FoundCall = CB;
+          }
+        }
+      }
+    }
+  } else {
+    // The insertion block didn't change
+    if (!CurBlock->empty()) {
+      llvm::Instruction &Inst = CurBlock->back();
+      if (auto *CB = dyn_cast<llvm::CallBase>(&Inst)) {
+        if (llvm::Function *F = CB->getCalledFunction()) {
+          if (F->getName().contains("CilkBeginWalk")) {
+            FoundCall = CB;
+          }
+        }
+      }
+    }
+  }
+  auto *CB = llvm::cast<llvm::CallBase>(FoundCall);
+  llvm::MDNode *BeginWalkMD = llvm::MDNode::get(getLLVMContext(), {});
+  CB->setMetadata("cilk.begin_walk", BeginWalkMD);
+  std::cout << "EMIT: Set begin walk metadata" << std::endl;
+
   EmitStmt(S.getWalkStmt());
   
   // Get our DeclRefExpr nodes from the statement
@@ -804,26 +837,27 @@ void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S,
   Expr *WalkRef = S.getWalkRef();
   Expr *LoopVarRef = S.getLoopVarRef();
   
-  // Initial check - if beginWalk returns null, we skip the loop entirely
-  LValue BeginWalkLV = EmitLValue(BeginWalkRef);
-  llvm::Value *BeginWalkFnPtr = BeginWalkLV.getPointer(*this);
-  QualType LoopVarType = LoopVarRef->getType();
-  llvm::Type *NodePtrType = llvm::PointerType::getUnqual(ConvertType(LoopVarType));
-  llvm::Type *BeginWalkFnType = BeginWalkFnPtr->getType();
-  llvm::FunctionType *BeginWalkFnTy = llvm::FunctionType::get(NodePtrType, {}, false);
-  llvm::Value *CastedBeginWalkFnPtr = BeginWalkFnPtr;
-  if (BeginWalkFnPtr->getType() != llvm::PointerType::getUnqual(BeginWalkFnTy)) {
-    CastedBeginWalkFnPtr = Builder.CreateBitCast(BeginWalkFnPtr, 
-                                               llvm::PointerType::getUnqual(BeginWalkFnTy));
-  }
-  llvm::CallInst *BeginWalkCall = Builder.CreateCall(BeginWalkFnTy, CastedBeginWalkFnPtr, {});
-  llvm::MDNode *BeginWalkMD = llvm::MDNode::get(getLLVMContext(), {});
-  BeginWalkCall->setMetadata("cilk.begin_walk", BeginWalkMD);
-  std::cout << "EMIT: Set begin walk metadata" << std::endl;
-
-  llvm::Value *IsBeginWalkNull = Builder.CreateIsNull(BeginWalkCall);
+  // // Initial check - if beginWalk returns null, we skip the loop entirely
+  // LValue BeginWalkLV = EmitLValue(BeginWalkRef);
+  // llvm::Value *BeginWalkFnPtr = BeginWalkLV.getPointer(*this);
+  // QualType LoopVarType = LoopVarRef->getType();
+  // llvm::Type *NodePtrType = llvm::PointerType::getUnqual(ConvertType(LoopVarType));
+  // llvm::Type *BeginWalkFnType = BeginWalkFnPtr->getType();
+  // llvm::FunctionType *BeginWalkFnTy = llvm::FunctionType::get(NodePtrType, {}, false);
+  // llvm::Value *CastedBeginWalkFnPtr = BeginWalkFnPtr;
+  // if (BeginWalkFnPtr->getType() != llvm::PointerType::getUnqual(BeginWalkFnTy)) {
+  //   CastedBeginWalkFnPtr = Builder.CreateBitCast(BeginWalkFnPtr, 
+  //                                              llvm::PointerType::getUnqual(BeginWalkFnTy));
+  // }
+  // llvm::CallInst *BeginWalkCall = Builder.CreateCall(BeginWalkFnTy, CastedBeginWalkFnPtr, {});
+  // llvm::MDNode *BeginWalkMD = llvm::MDNode::get(getLLVMContext(), {});
+  // BeginWalkCall->setMetadata("cilk.begin_walk", BeginWalkMD);
+  // std::cout << "EMIT: Set begin walk metadata" << std::endl;
+  llvm::Value *IsBeginWalkNull = Builder.CreateIsNull(CB);
 
   std::cout << "EMIT: Created isNull" << std::endl;
+
+
   // llvm::Value *IsBeginWalkNull = Builder.CreateIsNull(BeginWalkPtr);
   // if (llvm::Instruction *CmpInst = dyn_cast<llvm::Instruction>(IsBeginWalkNull)) {
   //   llvm::MDNode *MD = llvm::MDNode::get(getLLVMContext(), {});
@@ -860,10 +894,13 @@ void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S,
   // Create a call to CilkWalk with the current node as argument
   // This is a "faux" call that will be transformed by the LLVM pass
   llvm::Type *WalkFnType = WalkFnPtr->getType();
-  
+  std::cout << "EMIT: walkfntype: " << std::endl;
+  WalkFnType->dump();
   // We need to create a function type for the call
   // Assuming it's something like Node* (Node*)
   llvm::Type *NodePtrTy = CurrentNodePtr->getType();
+  std::cout << "EMIT: nodePtryTy: " << std::endl;
+  NodePtrTy->dump();
   llvm::Type *ReturnTy = NodePtrTy;  // Return type is the same as the argument
   llvm::Type *ArgTypes[] = {NodePtrTy};
   

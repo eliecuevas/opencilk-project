@@ -512,7 +512,7 @@ public:
     Function *WrapperFn, 
     SmallVector<Value *, 8> &LiveInVec, 
     StructType *EnvTy,
-    CallInst *BeginWalkCall);
+    CallBase *BeginWalkCall);
 
   DenseSet<Value *> getLiveInValues(Loop *L);
 
@@ -525,6 +525,10 @@ public:
   void fixLandingPadPHINodes(Function *F);
 
   void fixUnreachableBlockTerminators(Function *F);
+
+  void insertBypassLogicForInvoke(InvokeInst *NewInvoke, BasicBlock *NormalDest, Loop *L);
+
+  void switchOutlinedLoopVarInitialization(Loop *L, Function *OutlinedFn);
 
   Function *createCilkWalkWrapper(Function *OutlinedFn, const SmallVector<Value*, 8> &LiveInVec, StructType *EnvTy);
 
@@ -1702,12 +1706,152 @@ TaskOutlineMapTy LoopSpawningImpl::outlineAllTapirLoops() {
   return TaskToOutline;
 }
 
+void LoopSpawningImpl::insertBypassLogicForInvoke(InvokeInst *NewInvoke,
+                                BasicBlock *NormalDest,
+                                Loop *L) {
+  // 1) Gather the loop exit blocks (like in your original call-case code).
+  SmallVector<BasicBlock *, 8> ExitBlocks;
+  L->getExitBlocks(ExitBlocks);
+  if (ExitBlocks.empty()) {
+    std::cout << "ENV [INVOKE]: Warning: No loop exit blocks found" << std::endl;
+    return;
+  }
+
+  // Get the first non-landingpad exit block
+  BasicBlock *NullDest = nullptr;
+  for (BasicBlock *Candidate : ExitBlocks) {
+    // Is this block purely a landing pad?
+    bool IsLandingPadBlock = false;
+
+    for (Instruction &Inst : *Candidate) {
+      // Skip any PHI nodes at the start
+      if (isa<PHINode>(Inst))
+        continue;
+
+      // If the first non-PHI instruction is a landingpad, it's a landing-pad block
+      if (isa<LandingPadInst>(Inst)) {
+        IsLandingPadBlock = true;
+      }
+      // Once we see a non-phi and non-landingpad, we can break out of the loop
+      break;
+    }
+
+    if (!IsLandingPadBlock) {
+      NullDest = Candidate;
+      break;
+    }
+  }
+
+  // 2) Insert instructions at the start of NormalDest to do the `isNull` check
+  //    on the return value of the invoke.
+  //    The return value of the invoke is `NewInvoke` itself (an Instruction*).
+  //    If the invoked function returns a pointer, `NewInvoke` is also a Value*.
+  IRBuilder<> Builder(&*NormalDest->begin()); 
+  Value *RetVal = NewInvoke; // The pointer returned by the function
+  Value *IsNull = Builder.CreateIsNull(RetVal, "isNull");
+
+  // 3) Create a new block that will "bypass" the loop.  We'll unconditionally
+  //    branch from there to the exit block.  Insert it before the NullDest
+  //    so that it flows nicely in CFG order.
+  Function *F = NormalDest->getParent();
+  BasicBlock *BypassBlock = BasicBlock::Create(
+      F->getContext(),
+      "cilk.bypassed.loop.invoke",
+      F,
+      /*InsertBefore=*/NullDest
+  );
+  IRBuilder<> BypassBuilder(BypassBlock);
+  BypassBuilder.CreateBr(NullDest);
+
+  // 4) Now convert NormalDest's block terminator into a conditional branch.
+  //    The block *probably* had a default terminator (like a jump into the loop).
+  //    We'll override that to do:
+  //       if (isNull) goto NullDest else goto BypassBlock
+  //
+  //    So, remove the old terminator first (if it exists).
+  if (NormalDest->getTerminator())
+    NormalDest->getTerminator()->eraseFromParent();
+
+  Builder.SetInsertPoint(NormalDest);
+  Builder.CreateCondBr(IsNull, 
+                       /*TrueDest=*/BypassBlock, 
+                       /*FalseDest=*/BypassBlock);
+
+  // 5) Fix up PHI nodes in NullDest (and possibly other exit blocks) so that
+  //    all references that used to come from NormalDest or other loop blocks
+  //    are replaced with BypassBlock. This is the same logic as your call-case:
+  for (auto &I : *NullDest) {
+    if (PHINode *PN = dyn_cast<PHINode>(&I)) {
+      // For each incoming from NormalDest, or from blocks in L->getBlocks(),
+      // remove it and add an incoming from BypassBlock with the same value.
+      int idx = -1;
+      while ((idx = PN->getBasicBlockIndex(NormalDest)) != -1) {
+        Value *IncomingVal = PN->getIncomingValue(idx);
+        PN->removeIncomingValue(idx, false);
+        PN->addIncoming(IncomingVal, BypassBlock);
+      }
+      // Possibly also remove references from other loop blocks the same way
+      for (BasicBlock *BB : L->getBlocks()) {
+        int loopIdx = -1;
+        while ((loopIdx = PN->getBasicBlockIndex(BB)) != -1) {
+          Value *IncomingVal = PN->getIncomingValue(loopIdx);
+          PN->removeIncomingValue(loopIdx, false);
+          PN->addIncoming(IncomingVal, BypassBlock);
+        }
+      }
+    }
+  }
+
+  std::cout << "ENV [INVOKE]: Created clean bypass around loop with new BB and updated PHIs\n";
+}
+
+void LoopSpawningImpl::switchOutlinedLoopVarInitialization(Loop *L, Function *OutlinedFn) {
+  bool done = false;
+  for (BasicBlock *BB : L->getBlocks()) {
+    for (Instruction &I : *BB) {
+      for (Value *Op : I.operands()) {
+        if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
+          if (OpInst->getMetadata("cilk.begin_walk")) {
+            // we need to change the dummy loop var initialization uses in the outlined function 
+            // to go from waiting for the result from CilkBeginWalk (placeholder) to accepting the
+            // first parameter (ptr %0 probably)
+            // Get the first argument of the outlined function
+            if (OutlinedFn->arg_empty()) {
+              // Error handling if no arguments exist
+              std::cerr << "Error: Outlined function has no arguments" << std::endl;
+              return;
+            }
+            Argument *FirstArg = OutlinedFn->arg_begin();
+            // Find all uses of the CilkBeginWalk instruction in the outlined function
+            // and replace them with the first argument
+            for (User *U : OpInst->users()) {
+              if (Instruction *UseInst = dyn_cast<Instruction>(U)) {
+                // Check if this instruction is in the outlined function
+                if (UseInst->getFunction() == OutlinedFn) {
+                  // Replace the use with the first argument
+                  UseInst->replaceUsesOfWith(OpInst, FirstArg);
+                  std::cout << "Replaced use of CilkBeginWalk result with function argument" << std::endl;
+                }
+              }
+            }
+            done = true;
+            break; // Found and processed the cilk.begin_walk, break from operands loop
+          }
+        } 
+      }
+      if (done) break; // Break from instructions loop
+    }
+    if (done) break; // Break from basic blocks loop
+  }
+}
+
+
 void LoopSpawningImpl::insertEnvironmentAllocationAndCall(
   Loop *L, 
   Function *WrapperFn, 
   SmallVector<Value *, 8> &LiveInVec, 
   StructType *EnvTy,
-  CallInst *BeginWalkCall) {
+  CallBase *BeginWalkCall) {
 
   // Get the loop preheader or entry basic block
   BasicBlock *Preheader = L->getLoopPreheader();
@@ -1799,167 +1943,149 @@ void LoopSpawningImpl::insertEnvironmentAllocationAndCall(
   std::cout << "ENV: casted wrapper function" << std::endl;
 
   // Step 6: Create the new call to CilkBeginWalk, passing the wrapper function and environment
-  SmallVector<Value *, 2> CallArgs;
+  Value *FirstArg = BeginWalkCall->getArgOperand(0);
+  SmallVector<Value *, 3> CallArgs;
+  CallArgs.push_back(FirstArg);
   CallArgs.push_back(WrapperPtr);
   CallArgs.push_back(EnvAlloca);
   std::cout << "ENV: created new call args" << std::endl;
+  if (auto *Invoke = dyn_cast<InvokeInst>(BeginWalkCall)) {
+    std::cout << "ENV[INVOKE]: cilkBeginWalk was an invoke not a call" << std::endl;
+    BasicBlock *NormalDest  = Invoke->getNormalDest();
+    BasicBlock *UnwindDest  = Invoke->getUnwindDest();
+    InvokeInst * NewInvoke = CallBuilder.CreateInvoke(BeginWalkFnType, BeginWalkFn,
+                                        NormalDest, UnwindDest,
+                                        CallArgs, "new_begin_walk_invoke");
+    std::cout << "ENV[INVOKE]: created function invoke" << std::endl;
+    NewInvoke->setMetadata("cilk.begin_walk", Invoke->getMetadata("cilk.begin_walk"));
+    Invoke->replaceAllUsesWith(NewInvoke);
+    std::cout << "ENV[INVOKE]: replace uses of original invoke" << std::endl;
+    Invoke->eraseFromParent();
+    Value *InvokeVal = NewInvoke;  // The new invoke’s return
+    Type *PtrTy = InvokeVal->getType(); // e.g., ptr
+    Value *NullVal = ConstantPointerNull::get(cast<PointerType>(PtrTy));
 
-  // Create the call to replace the original one
-  CallInst *NewBeginWalkCall = CallBuilder.CreateCall(
-    BeginWalkFnType, BeginWalkFn, CallArgs, "new_begin_walk_call");
-  std::cout << "ENV: created function call" << std::endl;
+    // Accumulate uses to patch
+    SmallVector<Use*, 8> ToPatch;
+    for (Use &U : InvokeVal->uses()) {
+      Instruction *UserInst = dyn_cast<Instruction>(U.getUser());
+      if (!UserInst) continue;
 
-  // Copy relevant metadata from the original call
-  NewBeginWalkCall->setMetadata("cilk.begin_walk", BeginWalkCall->getMetadata("cilk.begin_walk"));
-
-  // Step 7: Replace uses of the original call with the new one
-  BeginWalkCall->replaceAllUsesWith(NewBeginWalkCall);
-  std::cout << "ENV: replace uses of original call" << std::endl;
-
-  // Remove the original call instruction
-  BeginWalkCall->eraseFromParent();
-  
-  std::cout << "ENV: Environment allocation and CilkBeginWalk call inserted" << std::endl;
-
-  // // Step 8: Bypass the original loop by identifying the loop exit blocks
-  // // and creating direct branches to them
-  // // Get the loop exit blocks
-  // SmallVector<BasicBlock *, 8> ExitBlocks;
-  // L->getExitBlocks(ExitBlocks);
-
-  // if (ExitBlocks.empty()) {
-  //   std::cout << "ENV: Warning: No loop exit blocks found" << std::endl;
-  //   return;
-  // }
-
-  // // Find the block with our new CilkBeginWalk call
-  // BasicBlock *CallBlock = NewBeginWalkCall->getParent();
-
-  // // Find the terminator instruction - it should be a conditional branch
-  // BranchInst *OldTerminator = dyn_cast<BranchInst>(CallBlock->getTerminator());
-  // if (!OldTerminator || !OldTerminator->isConditional()) {
-  //   std::cout << "ENV: Error: Expected conditional branch after CilkBeginWalk call" << std::endl;
-  //   return;
-  // }
-
-  // // Get the condition and the two destinations
-  // Value *Condition = OldTerminator->getCondition();
-  // BasicBlock *NullDest = OldTerminator->getSuccessor(0); // Typically the exit block when null
-
-  // // Keep the null destination (typically exit block)
-  // // But redirect the non-null destination to the loop exit block instead of loop entry
-  // // This preserves the null check but bypasses the loop
-  // OldTerminator->eraseFromParent();
-
-  // // Create a new conditional branch that keeps the null check but just goes to
-  // // original dest anyway
-  // IRBuilder<> CondBuilder(CallBlock);
-  // CondBuilder.CreateCondBr(Condition, NullDest, NullDest);
-
-  // std::cout << "ENV: Preserved null check while redirecting to exit block" << std::endl;
-
-  // // Mark the original loop blocks as unreachable
-  // for (BasicBlock *BB : L->getBlocks()) {
-  //   // Skip blocks that might still be needed
-  //   if (BB == CallBlock || BB == NullDest || std::find(ExitBlocks.begin(), ExitBlocks.end(), BB) != ExitBlocks.end())
-  //     continue;
-
-  //   // If the block is now unreachable, mark it as such
-  //   if (!BB->hasAddressTaken()) {
-  //     // Clear the block except for the terminator
-  //     while (!BB->empty() && !BB->begin()->isTerminator())
-  //       BB->begin()->eraseFromParent();
-      
-  //     // If no terminator exists, add unreachable
-  //     if (!BB->getTerminator())
-  //       new UnreachableInst(BB->getContext(), BB);
-  //   }
-  // }
-
-  // std::cout << "ENV: Marked original loop blocks as unreachable" << std::endl;
-
-  // Get the loop exit blocks
-  SmallVector<BasicBlock *, 8> ExitBlocks;
-  L->getExitBlocks(ExitBlocks);
-
-  if (ExitBlocks.empty()) {
-    std::cout << "ENV: Warning: No loop exit blocks found" << std::endl;
-    return;
-  }
-
-  // Find the block with our new CilkBeginWalk call
-  BasicBlock *CallBlock = NewBeginWalkCall->getParent();
-
-  // Find the terminator instruction - it should be a conditional branch
-  BranchInst *OldTerminator = dyn_cast<BranchInst>(CallBlock->getTerminator());
-  if (!OldTerminator || !OldTerminator->isConditional()) {
-    std::cout << "ENV: Error: Expected conditional branch after CilkBeginWalk call" << std::endl;
-    return;
-  }
-
-  // Get the condition and the two destinations
-  Value *Condition = OldTerminator->getCondition();
-  BasicBlock *NullDest = OldTerminator->getSuccessor(0); // Typically the exit block when null
-  BasicBlock *NonNullDest = OldTerminator->getSuccessor(1); // Typically the loop entry
-
-  // The safer approach is to:
-  // 1. Create a new basic block to handle the non-null case
-  // 2. Make it branch directly to the exit
-  // 3. Update PHI nodes in the exit block if necessary
-
-  // Create a new basic block after the call block
-  Function *F = CallBlock->getParent();
-  BasicBlock *NewExitBridge = BasicBlock::Create(
-      F->getContext(), 
-      "cilk.bypassed.loop", 
-      F, 
-      NullDest // Insert before the exit block
-  );
-
-  // Create an unconditional branch from our new block to the exit block
-  IRBuilder<> BridgeBuilder(NewExitBridge);
-  BridgeBuilder.CreateBr(NullDest);
-
-  // Now, update the original terminator to branch to our new block instead of the loop
-  IRBuilder<> CondBuilder(CallBlock);
-  OldTerminator->eraseFromParent();
-  CondBuilder.CreateCondBr(Condition, NullDest, NewExitBridge);
-
-  std::cout << "ENV: Created clean bypass around loop with new basic block" << std::endl;
-
-  // Handle PHI nodes in the exit block
-  for (BasicBlock::iterator I = NullDest->begin(); 
-      PHINode *PN = dyn_cast<PHINode>(I); ++I) {
-    
-    // For each original incoming edge from the loop, we need to update it
-    int LoopEntryIdx = PN->getBasicBlockIndex(NonNullDest);
-    if (LoopEntryIdx != -1) {
-      Value *IncomingValue = PN->getIncomingValue(LoopEntryIdx);
-      
-      // Remove the old incoming edge
-      PN->removeIncomingValue(LoopEntryIdx, false);
-      
-      // Add the new incoming edge from our bridge block
-      PN->addIncoming(IncomingValue, NewExitBridge);
-    }
-    
-    // Also check for other incoming edges from loop blocks
-    for (BasicBlock *BB : L->getBlocks()) {
-      int Idx = PN->getBasicBlockIndex(BB);
-      if (Idx != -1) {
-        Value *IncomingValue = PN->getIncomingValue(Idx);
-        
-        // Remove the old incoming edge
-        PN->removeIncomingValue(Idx, false);
-        
-        // Add new incoming edge from our bridge block
-        PN->addIncoming(IncomingValue, NewExitBridge);
+      // If the user is in a block that's known to be dead (e.g., belongs to the old loop)
+      if (L->contains(UserInst->getParent())) {
+        ToPatch.push_back(&U);
       }
     }
+
+    // Now replace them with null
+    for (Use *U : ToPatch) {
+      U->set(NullVal);
+    }
+    std::cout << "ENV[INVOKE]: Environment allocation and CilkBeginWalk invoke inserted" << std::endl;
+    insertBypassLogicForInvoke(NewInvoke, NormalDest, L);
+
+
+  } else {
+    std::cout << "ENV [CALL]: cilkBeginWalk was a call not an invoke" << std::endl;
+    // Create the call to replace the original one
+    CallInst *NewBeginWalkCall = CallBuilder.CreateCall(
+      BeginWalkFnType, BeginWalkFn, CallArgs, "new_begin_walk_call");
+    std::cout << "ENV [CALL]: created function call" << std::endl;
+
+    // Copy relevant metadata from the original call
+    NewBeginWalkCall->setMetadata("cilk.begin_walk", BeginWalkCall->getMetadata("cilk.begin_walk"));
+
+    // Step 7: Replace uses of the original call with the new one
+    BeginWalkCall->replaceAllUsesWith(NewBeginWalkCall);
+    std::cout << "ENV [CALL]: replace uses of original call" << std::endl;
+
+    // Remove the original call instruction
+    BeginWalkCall->eraseFromParent();
+    
+    std::cout << "ENV [CALL]: Environment allocation and CilkBeginWalk call inserted" << std::endl;
+
+    // Get the loop exit blocks
+    SmallVector<BasicBlock *, 8> ExitBlocks;
+    L->getExitBlocks(ExitBlocks);
+
+    if (ExitBlocks.empty()) {
+      std::cout << "ENV [CALL]: Warning: No loop exit blocks found" << std::endl;
+      return;
+    }
+
+    // Find the block with our new CilkBeginWalk call
+    BasicBlock *CallBlock = NewBeginWalkCall->getParent();
+
+    // Find the terminator instruction - it should be a conditional branch
+    BranchInst *OldTerminator = dyn_cast<BranchInst>(CallBlock->getTerminator());
+    if (!OldTerminator || !OldTerminator->isConditional()) {
+      std::cout << "ENV [CALL]: Error: Expected conditional branch after CilkBeginWalk call" << std::endl;
+      return;
+    }
+
+    // Get the condition and the two destinations
+    Value *Condition = OldTerminator->getCondition();
+    BasicBlock *NullDest = OldTerminator->getSuccessor(0); // Typically the exit block when null
+    BasicBlock *NonNullDest = OldTerminator->getSuccessor(1); // Typically the loop entry
+
+    // The safer approach is to:
+    // 1. Create a new basic block to handle the non-null case
+    // 2. Make it branch directly to the exit
+    // 3. Update PHI nodes in the exit block if necessary
+
+    // Create a new basic block after the call block
+    Function *F = CallBlock->getParent();
+    BasicBlock *NewExitBridge = BasicBlock::Create(
+        F->getContext(), 
+        "cilk.bypassed.loop", 
+        F, 
+        NullDest // Insert before the exit block
+    );
+
+    // Create an unconditional branch from our new block to the exit block
+    IRBuilder<> BridgeBuilder(NewExitBridge);
+    BridgeBuilder.CreateBr(NullDest);
+
+    // Now, update the original terminator to branch to our new block instead of the loop
+    IRBuilder<> CondBuilder(CallBlock);
+    OldTerminator->eraseFromParent();
+    CondBuilder.CreateCondBr(Condition, NullDest, NewExitBridge);
+
+    std::cout << "ENV [CALL]: Created clean bypass around loop with new basic block" << std::endl;
+
+    // Handle PHI nodes in the exit block
+    for (BasicBlock::iterator I = NullDest->begin(); 
+        PHINode *PN = dyn_cast<PHINode>(I); ++I) {
+      
+      // For each original incoming edge from the loop, we need to update it
+      int LoopEntryIdx = PN->getBasicBlockIndex(NonNullDest);
+      if (LoopEntryIdx != -1) {
+        Value *IncomingValue = PN->getIncomingValue(LoopEntryIdx);
+        
+        // Remove the old incoming edge
+        PN->removeIncomingValue(LoopEntryIdx, false);
+        
+        // Add the new incoming edge from our bridge block
+        PN->addIncoming(IncomingValue, NewExitBridge);
+      }
+      
+      // Also check for other incoming edges from loop blocks
+      for (BasicBlock *BB : L->getBlocks()) {
+        int Idx = PN->getBasicBlockIndex(BB);
+        if (Idx != -1) {
+          Value *IncomingValue = PN->getIncomingValue(Idx);
+          
+          // Remove the old incoming edge
+          PN->removeIncomingValue(Idx, false);
+          
+          // Add new incoming edge from our bridge block
+          PN->addIncoming(IncomingValue, NewExitBridge);
+        }
+      }
+    }
+
+    std::cout << "ENV [CALL]: Updated PHI nodes in exit block" << std::endl;
   }
-
-  std::cout << "ENV: Updated PHI nodes in exit block" << std::endl;
-
 }
 
 Function *LoopSpawningImpl::createCilkWalkWrapper(Function *OutlinedFn,
@@ -2153,6 +2279,8 @@ const DenseSet<Value *> &liveIns, const DenseSet<Value *> &liveOuts) {
     if (!LITy->isSized()){
       LITy = LITy->getPointerTo();
     }
+    std::cerr << "OUTLINE: Real live in type:" << std::endl;
+    LITy->dump();
     ArgTypes.push_back(LI->getType());
     EnvFieldTypes.push_back(LI->getType());
   }
@@ -2262,8 +2390,20 @@ DenseSet<Value *> LoopSpawningImpl::getLiveInValues(Loop *L) {
   DenseSet<Value *> LiveIns;
   for (BasicBlock *BB : L->getBlocks()) {
     for (Instruction &I : *BB) {
+      if (CallBase *CI = dyn_cast<CallBase>(&I)) {
+        if (CI->getMetadata("cilk.walk") || CI->getMetadata("cilk.begin_walk")) {
+          // we don't want to consider the faux cilk walk call or the cilk walk call as a real live-in
+          // (even though they are used in the loop but created outside of it)
+          continue;
+        }
+      }
       for (Value *Op : I.operands()) {
         if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
+          if (OpInst->getMetadata("cilk.walk") || OpInst->getMetadata("cilk.begin_walk")) {
+            // we don't want to consider the faux cilk walk call or the cilk walk call as a real live-in
+            // (even though they are used in the loop but created outside of it)
+            continue;
+          }
           if (!L->contains(OpInst->getParent()))
             LiveIns.insert(Op);
         } else if (!isa<Constant>(Op)) {
@@ -2271,6 +2411,10 @@ DenseSet<Value *> LoopSpawningImpl::getLiveInValues(Loop *L) {
         }
       }
     }
+  }
+  for (Value *V : LiveIns){
+    std::cerr << "Live in value" << std::endl;
+    V->dump();
   }
   return LiveIns;
 }
@@ -2447,30 +2591,33 @@ void LoopSpawningImpl::fixLandingPadPHINodes(Function *F) {
 bool LoopSpawningImpl::processCilkWalkLoop(Loop *L) {
   // Variables to store found function references.
   Value *CilkWalkFnRef = nullptr;
-  CallInst *CilkWalkCall = nullptr;
-  Type *CilkWalkReturnType = nullptr;
-  CallInst *CilkBeginWalkCall = nullptr;
+  CallBase *CilkWalkCall = nullptr;
+  Type *CilkBeginWalkReturnType = nullptr;
+  CallBase *CilkBeginWalkCall = nullptr;
   Value *CilkBeginWalkFnRef = nullptr;
 
 
 
   
   // Look for the cilk.walk and cilk.begin_walk calls.
+  // CilkWalk and CilkBeginWalk should return the same thing, so
+  // we will use the Cilk Begin Walk Return value for outlining
+  // as the call to CilkWalk is a faux call
   for (BasicBlock &BB : F) {
     if (CilkWalkCall && CilkBeginWalkCall)
       break;
     for (Instruction &I : BB) {
       if (CilkWalkCall && CilkBeginWalkCall)
         break;
-      if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+      if (CallBase *CI = dyn_cast<CallBase>(&I)) {
         if (CI->getMetadata("cilk.walk")) {
           CilkWalkCall = CI;
-          CilkWalkReturnType = CI->getType();
           CilkWalkFnRef = CI->getCalledOperand();
           std::cout << "Found call with cilk.walk metadata and updated CilkWalkFnRef" << std::endl;
           break;
         } else if (CI->getMetadata("cilk.begin_walk")) {
           CilkBeginWalkFnRef = CI->getCalledOperand();
+          CilkBeginWalkReturnType = CI->getType();
           CilkBeginWalkCall = CI;
           std::cout << "Found call with cilk.begin_walk metadata and updated CilkBeginWalkFnRef" << std::endl;
         }
@@ -2495,8 +2642,10 @@ bool LoopSpawningImpl::processCilkWalkLoop(Loop *L) {
   std::cout << "PROCESS: Got live out values" << std::endl;
 
   // Outline the loop body.
-  OutlinedLoopInfo outlinedLoopInfo = outlineCilkWalkLoop(L, CilkWalkReturnType, liveIns, liveOuts);
+  OutlinedLoopInfo outlinedLoopInfo = outlineCilkWalkLoop(L, CilkBeginWalkReturnType, liveIns, liveOuts);
   std::cout << "PROCESS: Outlined Cilk Walk Loop" << std::endl;
+
+  switchOutlinedLoopVarInitialization(L, outlinedLoopInfo.OutlinedFn);
 
   // Rewrite the call site (e.g. in CilkBeginWalk)
   // to pass the wrapper function pointer (outlinedLoopInfo.WrapperFn) along with
@@ -2508,6 +2657,7 @@ bool LoopSpawningImpl::processCilkWalkLoop(Loop *L) {
     outlinedLoopInfo.EnvTy,      
     CilkBeginWalkCall);
 
+  
   // // // Ensure exception handling paths for outlined loop body function and original loop don't merge 
   // // // This ensures a control flow can be properly analyzed
   // isolateLoopExceptionHandling(L, outlinedLoopInfo.OutlinedFn);
