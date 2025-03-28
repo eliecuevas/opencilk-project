@@ -33,6 +33,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <iostream>
+
 using namespace llvm;
 
 #define DEBUG_TYPE "task-info"
@@ -1768,6 +1770,27 @@ PreservedAnalyses TaskVerifierPass::run(Function &F,
 Task *llvm::getTaskIfTapirLoopStructure(const Loop *L, TaskInfo *TI) {
   if (!L || !TI)
     return nullptr;
+
+  // bool HasCilkWalkMetadata = false;
+  // for (BasicBlock *BB : L->blocks()) {
+  //   for (Instruction &I : *BB) {
+  //     if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+  //       if (CI->getMetadata("cilk.walk")) {
+  //         std::cout << "Found cilk.walk metadata in loop!" << std::endl;
+  //         HasCilkWalkMetadata = true;
+  //         break;
+  //       }
+  //     }
+  //   }
+  //   if (HasCilkWalkMetadata) break;
+  // }
+
+  // if (HasCilkWalkMetadata){
+  //   const BasicBlock *Header = L->getHeader();
+  //   const DetachInst *DI = dyn_cast<DetachInst>(Header->getTerminator());
+  //   Task *T = TI->getTaskFor(DI->getDetached());
+  //   return T; 
+  // }
 
   const BasicBlock *Header = L->getHeader();
   const BasicBlock *Latch = L->getLoopLatch();

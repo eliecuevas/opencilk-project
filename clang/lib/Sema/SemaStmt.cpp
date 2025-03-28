@@ -4441,9 +4441,26 @@ StmtResult Sema::ActOnCilkForRangeWalkStmt(Scope *S, SourceLocation ForLoc,
     }
     std::cout << "ACT independent: both walk and begin are valid" << std::endl;
 
-    // For BeginWalkMember, create a call to get the starting node
-    ExprResult BeginWalkCall = ActOnCallExpr(S, BeginWalkMember.get(), RangeLoc,
-          /*args*/ {}, RangeLoc);
+    // Create null pointers for both arguments using the correct Clang API
+    ExprResult FunctionArg = ActOnCXXNullPtrLiteral(RangeLoc);
+    ExprResult EnvArg = ActOnCXXNullPtrLiteral(RangeLoc);
+
+    // Cast them to the appropriate types if needed
+    FunctionArg = ImpCastExprToType(FunctionArg.get(), Context.VoidPtrTy, CK_NullToPointer);
+    EnvArg = ImpCastExprToType(EnvArg.get(), Context.VoidPtrTy, CK_NullToPointer);
+
+    // Create the arguments array properly
+    Expr *ArgsArray[2] = {FunctionArg.get(), EnvArg.get()};
+    MultiExprArg Args(ArgsArray, 2);
+
+    // Call ActOnCallExpr with the proper syntax for multiple arguments
+    ExprResult BeginWalkCall = ActOnCallExpr(
+        S, 
+        BeginWalkMember.get(), 
+        RangeLoc,
+        Args, 
+        RangeLoc
+    );
     if (BeginWalkCall.isInvalid()) {
       ActOnInitializerError(LoopVar);
       std::cout << "ACT independent: BeginWalkCall is invalid" << std::endl;

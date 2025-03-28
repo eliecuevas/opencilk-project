@@ -785,7 +785,8 @@ CodeGenFunction::EmitCilkForRangeStmt(const CilkForRangeStmt &S,
     delete TempInvokeDest;
 }
 
-void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S) {
+void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S, 
+                                                ArrayRef<const Attr *> ForAttrs) {
   std::cout << "EMIT: entering emit" << std::endl;
   // Create the basic blocks for the loop structure
   JumpDest LoopExit = getJumpDestInCurrentScope("cilk.for.end");
@@ -805,8 +806,30 @@ void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S) {
   
   // Initial check - if beginWalk returns null, we skip the loop entirely
   LValue BeginWalkLV = EmitLValue(BeginWalkRef);
-  llvm::Value *BeginWalkPtr = BeginWalkLV.getPointer(*this);
-  llvm::Value *IsBeginWalkNull = Builder.CreateIsNull(BeginWalkPtr);
+  llvm::Value *BeginWalkFnPtr = BeginWalkLV.getPointer(*this);
+  QualType LoopVarType = LoopVarRef->getType();
+  llvm::Type *NodePtrType = llvm::PointerType::getUnqual(ConvertType(LoopVarType));
+  llvm::Type *BeginWalkFnType = BeginWalkFnPtr->getType();
+  llvm::FunctionType *BeginWalkFnTy = llvm::FunctionType::get(NodePtrType, {}, false);
+  llvm::Value *CastedBeginWalkFnPtr = BeginWalkFnPtr;
+  if (BeginWalkFnPtr->getType() != llvm::PointerType::getUnqual(BeginWalkFnTy)) {
+    CastedBeginWalkFnPtr = Builder.CreateBitCast(BeginWalkFnPtr, 
+                                               llvm::PointerType::getUnqual(BeginWalkFnTy));
+  }
+  llvm::CallInst *BeginWalkCall = Builder.CreateCall(BeginWalkFnTy, CastedBeginWalkFnPtr, {});
+  llvm::MDNode *BeginWalkMD = llvm::MDNode::get(getLLVMContext(), {});
+  BeginWalkCall->setMetadata("cilk.begin_walk", BeginWalkMD);
+  std::cout << "EMIT: Set begin walk metadata" << std::endl;
+
+  llvm::Value *IsBeginWalkNull = Builder.CreateIsNull(BeginWalkCall);
+
+  std::cout << "EMIT: Created isNull" << std::endl;
+  // llvm::Value *IsBeginWalkNull = Builder.CreateIsNull(BeginWalkPtr);
+  // if (llvm::Instruction *CmpInst = dyn_cast<llvm::Instruction>(IsBeginWalkNull)) {
+  //   llvm::MDNode *MD = llvm::MDNode::get(getLLVMContext(), {});
+  //   CmpInst->setMetadata("cilk.walk.begin_check", MD);
+  //   std::cout << "Set begin walk metadata" << std::endl;
+  // }
   Builder.CreateCondBr(IsBeginWalkNull, LoopExit.getBlock(), LoopCond.getBlock());
   std::cout << "EMIT: created first condbr" << std::endl;
   // Loop condition block - initialize the loop variable from the current node
@@ -818,6 +841,11 @@ void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S) {
   EmitStmt(S.getBody());
   Builder.CreateBr(LoopIncrement.getBlock());
   std::cout << "EMIT: created br" << std::endl;
+  LoopStack.setSpawnStrategy(LoopAttributes::Walk);
+  const SourceRange &R = S.getSourceRange();
+  LoopStack.push(LoopCond.getBlock(), CGM.getContext(), CGM.getCodeGenOpts(), ForAttrs,
+                 SourceLocToDebugLoc(R.getBegin()),
+                 SourceLocToDebugLoc(R.getEnd()));
   // Loop increment - call CilkWalk to advance to the next node
   EmitBlock(LoopIncrement.getBlock());
   
@@ -863,8 +891,13 @@ void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S) {
   
   // Check if the result is null to determine whether to continue
   llvm::Value *IsNextNodeNull = Builder.CreateIsNull(WalkCall);
-  Builder.CreateCondBr(IsNextNodeNull, LoopExit.getBlock(), LoopCond.getBlock());
+  llvm::MDNode *NullMD = llvm::MDNode::get(getLLVMContext(), {});
+  cast<llvm::Instruction>(IsNextNodeNull)->setMetadata("cilk.walk.control.flow", NullMD);
+  llvm::BranchInst *CondBr = Builder.CreateCondBr(IsNextNodeNull, LoopExit.getBlock(), LoopCond.getBlock());
+  llvm::MDNode *BranchMD = llvm::MDNode::get(getLLVMContext(), {});
+  CondBr->setMetadata("cilk.walk.control.flow", BranchMD);
   std::cout << "EMIT: built final condbr" << std::endl;
+  LoopStack.pop();
   // Emit the exit block
   EmitBlock(LoopExit.getBlock());
   std::cout << "EMIT: success, returning" << std::endl;

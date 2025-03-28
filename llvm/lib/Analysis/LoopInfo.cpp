@@ -37,6 +37,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/GenericLoopInfoImpl.h"
 #include "llvm/Support/raw_ostream.h"
+#include <iostream>
 using namespace llvm;
 
 // Explicitly instantiate methods in LoopInfoImpl.h for IR-level Loops.
@@ -1225,6 +1226,7 @@ LoopInfo LoopAnalysis::run(Function &F, FunctionAnalysisManager &AM) {
   // objects. I don't want to add that kind of complexity until the scope of
   // the problem is better understood.
   LoopInfo LI;
+  // std::cout << "LoopInfo: running" << std::endl;
   LI.analyze(AM.getResult<DominatorTreeAnalysis>(F));
   return LI;
 }

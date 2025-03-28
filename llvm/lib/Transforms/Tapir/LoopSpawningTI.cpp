@@ -52,8 +52,10 @@
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/TapirUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
-
+#include "llvm/IR/InstIterator.h" 
+#include <iostream>
 #include <utility>
+#include <string>   // For std::string conversion
 
 using namespace llvm;
 
@@ -491,7 +493,40 @@ public:
     LoopToTapirLoop.clear();
   }
 
+  struct OutlinedLoopInfo {
+    Function *OutlinedFn;
+    Function *WrapperFn;
+    DenseMap<Value*, Value*> LiveOutMapping;
+    SmallVector<Value *, 8> LiveInVec;
+    StructType *EnvTy;  
+  };
+
+  void isolateLoopExceptionHandling(Loop *L, Function *OutlinedFn);
+
   bool run();
+  void deleteBlock(llvm::StringRef blockName);
+  bool processCilkWalkLoop(Loop *L);
+
+  void insertEnvironmentAllocationAndCall(
+    Loop *L, 
+    Function *WrapperFn, 
+    SmallVector<Value *, 8> &LiveInVec, 
+    StructType *EnvTy,
+    CallInst *BeginWalkCall);
+
+  DenseSet<Value *> getLiveInValues(Loop *L);
+
+  OutlinedLoopInfo outlineCilkWalkLoop(Loop *L, Type *CilkWalkReturnType, const DenseSet<Value *> &LiveIns, const DenseSet<Value *> &liveOuts);
+
+  DenseSet<Value *> getLiveOutValues(Loop *L);
+
+  void fixInvokeAndBadReferences(Function *F);
+
+  void fixLandingPadPHINodes(Function *F);
+
+  void fixUnreachableBlockTerminators(Function *F);
+
+  Function *createCilkWalkWrapper(Function *OutlinedFn, const SmallVector<Value*, 8> &LiveInVec, StructType *EnvTy);
 
   // If loop \p L defines a recorded Tapir loop, returns the Tapir loop info for
   // that Tapir loop.  Otherwise returns null.
@@ -1667,16 +1702,1010 @@ TaskOutlineMapTy LoopSpawningImpl::outlineAllTapirLoops() {
   return TaskToOutline;
 }
 
-bool LoopSpawningImpl::run() {
-  if (TI.isSerial())
+void LoopSpawningImpl::insertEnvironmentAllocationAndCall(
+  Loop *L, 
+  Function *WrapperFn, 
+  SmallVector<Value *, 8> &LiveInVec, 
+  StructType *EnvTy,
+  CallInst *BeginWalkCall) {
+
+  // Get the loop preheader or entry basic block
+  BasicBlock *Preheader = L->getLoopPreheader();
+  if (!Preheader) {
+    std::cout << "ENV: Error: Loop does not have a preheader" << std::endl;
+    return;
+  }
+  
+  // Create an IRBuilder to insert instructions at the end of the preheader
+  IRBuilder<> Builder(BeginWalkCall);
+  
+  // Step 1: Allocate the environment structure
+  AllocaInst *EnvAlloca = Builder.CreateAlloca(EnvTy, nullptr, "cilk_walk_env_alloca");
+  std::cout << "ENV: created alloca" << std::endl;
+
+  // Step 2: Populate the environment with live-in values
+  for (unsigned i = 0, e = LiveInVec.size(); i < e; ++i) {
+    Value *LiveIn = LiveInVec[i];
+    
+    // Skip label type values
+    if (LiveIn->getType()->isLabelTy())
+      continue;
+    
+    // Get a pointer to the i-th field of the environment structure
+    Value *FieldPtr = Builder.CreateStructGEP(EnvTy, EnvAlloca, i, "env.field.ptr");
+    
+    // Store the live-in value to the environment
+    Builder.CreateStore(LiveIn, FieldPtr);
+  }
+  std::cout << "ENV: environment populated" << std::endl;
+
+  // Step 3: Find insertion point for the CilkBeginWalk call
+  // We'll replace the original begin_walk call with our new one
+  IRBuilder<> CallBuilder(BeginWalkCall);
+
+  // Step 4: Get the function pointer for CilkBeginWalk from the call
+  Value *BeginWalkFn = BeginWalkCall->getCalledOperand();
+  std::cout << "ENV: got function pointer" << std::endl;
+
+  // Get the function type for the callback parameter
+  FunctionType *BeginWalkFnType = nullptr;
+  Type *CallbackType = nullptr;
+  
+  // Check if the function has parameters
+  CallBase *CB = dyn_cast<CallBase>(BeginWalkCall);
+  if (CB) {
+    BeginWalkFnType = CB->getFunctionType();
+    
+    // If the function has no parameters, we need to create a new function type
+    if (BeginWalkFnType->getNumParams() == 0) {
+      std::cout << "ENV: BeginWalkFn has no parameters, creating new function type" << std::endl;
+      
+      // Get the return type from the original function
+      Type *ReturnTy = BeginWalkFnType->getReturnType();
+      
+      // Create parameter types for the new function type
+      SmallVector<Type *, 2> ParamTypes;
+      
+      // First parameter: function pointer type (use void* as placeholder)
+      // Use the proper way to create pointer types in LLVM
+      LLVMContext &Ctx = BeginWalkCall->getContext();
+      CallbackType = PointerType::get(Ctx, 0); // Generic pointer type with default address space
+      ParamTypes.push_back(CallbackType);
+      
+      // Second parameter: environment pointer (void*)
+      ParamTypes.push_back(PointerType::get(Ctx, 0)); // Generic pointer type
+      
+      // Create new function type with parameters
+      BeginWalkFnType = FunctionType::get(ReturnTy, ParamTypes, false);
+    } else {
+      // The function already has parameters, get the callback type
+      CallbackType = BeginWalkFnType->getParamType(0);
+    }
+  } else {
+    std::cout << "ENV: Error: BeginWalkCall is not a CallBase" << std::endl;
+    return;
+  }
+  
+  if (!CallbackType) {
+    std::cout << "ENV: Error: Could not determine callback type" << std::endl;
+    return;
+  }
+  
+  std::cout << "ENV: function type obtained for callback parameter" << std::endl;
+
+  // Cast our wrapper function to the expected callback type
+  Value *WrapperPtr = CallBuilder.CreateBitCast(
+      WrapperFn, CallbackType, "wrapper_fn_cast");
+  std::cout << "ENV: casted wrapper function" << std::endl;
+
+  // Step 6: Create the new call to CilkBeginWalk, passing the wrapper function and environment
+  SmallVector<Value *, 2> CallArgs;
+  CallArgs.push_back(WrapperPtr);
+  CallArgs.push_back(EnvAlloca);
+  std::cout << "ENV: created new call args" << std::endl;
+
+  // Create the call to replace the original one
+  CallInst *NewBeginWalkCall = CallBuilder.CreateCall(
+    BeginWalkFnType, BeginWalkFn, CallArgs, "new_begin_walk_call");
+  std::cout << "ENV: created function call" << std::endl;
+
+  // Copy relevant metadata from the original call
+  NewBeginWalkCall->setMetadata("cilk.begin_walk", BeginWalkCall->getMetadata("cilk.begin_walk"));
+
+  // Step 7: Replace uses of the original call with the new one
+  BeginWalkCall->replaceAllUsesWith(NewBeginWalkCall);
+  std::cout << "ENV: replace uses of original call" << std::endl;
+
+  // Remove the original call instruction
+  BeginWalkCall->eraseFromParent();
+  
+  std::cout << "ENV: Environment allocation and CilkBeginWalk call inserted" << std::endl;
+
+  // // Step 8: Bypass the original loop by identifying the loop exit blocks
+  // // and creating direct branches to them
+  // // Get the loop exit blocks
+  // SmallVector<BasicBlock *, 8> ExitBlocks;
+  // L->getExitBlocks(ExitBlocks);
+
+  // if (ExitBlocks.empty()) {
+  //   std::cout << "ENV: Warning: No loop exit blocks found" << std::endl;
+  //   return;
+  // }
+
+  // // Find the block with our new CilkBeginWalk call
+  // BasicBlock *CallBlock = NewBeginWalkCall->getParent();
+
+  // // Find the terminator instruction - it should be a conditional branch
+  // BranchInst *OldTerminator = dyn_cast<BranchInst>(CallBlock->getTerminator());
+  // if (!OldTerminator || !OldTerminator->isConditional()) {
+  //   std::cout << "ENV: Error: Expected conditional branch after CilkBeginWalk call" << std::endl;
+  //   return;
+  // }
+
+  // // Get the condition and the two destinations
+  // Value *Condition = OldTerminator->getCondition();
+  // BasicBlock *NullDest = OldTerminator->getSuccessor(0); // Typically the exit block when null
+
+  // // Keep the null destination (typically exit block)
+  // // But redirect the non-null destination to the loop exit block instead of loop entry
+  // // This preserves the null check but bypasses the loop
+  // OldTerminator->eraseFromParent();
+
+  // // Create a new conditional branch that keeps the null check but just goes to
+  // // original dest anyway
+  // IRBuilder<> CondBuilder(CallBlock);
+  // CondBuilder.CreateCondBr(Condition, NullDest, NullDest);
+
+  // std::cout << "ENV: Preserved null check while redirecting to exit block" << std::endl;
+
+  // // Mark the original loop blocks as unreachable
+  // for (BasicBlock *BB : L->getBlocks()) {
+  //   // Skip blocks that might still be needed
+  //   if (BB == CallBlock || BB == NullDest || std::find(ExitBlocks.begin(), ExitBlocks.end(), BB) != ExitBlocks.end())
+  //     continue;
+
+  //   // If the block is now unreachable, mark it as such
+  //   if (!BB->hasAddressTaken()) {
+  //     // Clear the block except for the terminator
+  //     while (!BB->empty() && !BB->begin()->isTerminator())
+  //       BB->begin()->eraseFromParent();
+      
+  //     // If no terminator exists, add unreachable
+  //     if (!BB->getTerminator())
+  //       new UnreachableInst(BB->getContext(), BB);
+  //   }
+  // }
+
+  // std::cout << "ENV: Marked original loop blocks as unreachable" << std::endl;
+
+  // Get the loop exit blocks
+  SmallVector<BasicBlock *, 8> ExitBlocks;
+  L->getExitBlocks(ExitBlocks);
+
+  if (ExitBlocks.empty()) {
+    std::cout << "ENV: Warning: No loop exit blocks found" << std::endl;
+    return;
+  }
+
+  // Find the block with our new CilkBeginWalk call
+  BasicBlock *CallBlock = NewBeginWalkCall->getParent();
+
+  // Find the terminator instruction - it should be a conditional branch
+  BranchInst *OldTerminator = dyn_cast<BranchInst>(CallBlock->getTerminator());
+  if (!OldTerminator || !OldTerminator->isConditional()) {
+    std::cout << "ENV: Error: Expected conditional branch after CilkBeginWalk call" << std::endl;
+    return;
+  }
+
+  // Get the condition and the two destinations
+  Value *Condition = OldTerminator->getCondition();
+  BasicBlock *NullDest = OldTerminator->getSuccessor(0); // Typically the exit block when null
+  BasicBlock *NonNullDest = OldTerminator->getSuccessor(1); // Typically the loop entry
+
+  // The safer approach is to:
+  // 1. Create a new basic block to handle the non-null case
+  // 2. Make it branch directly to the exit
+  // 3. Update PHI nodes in the exit block if necessary
+
+  // Create a new basic block after the call block
+  Function *F = CallBlock->getParent();
+  BasicBlock *NewExitBridge = BasicBlock::Create(
+      F->getContext(), 
+      "cilk.bypassed.loop", 
+      F, 
+      NullDest // Insert before the exit block
+  );
+
+  // Create an unconditional branch from our new block to the exit block
+  IRBuilder<> BridgeBuilder(NewExitBridge);
+  BridgeBuilder.CreateBr(NullDest);
+
+  // Now, update the original terminator to branch to our new block instead of the loop
+  IRBuilder<> CondBuilder(CallBlock);
+  OldTerminator->eraseFromParent();
+  CondBuilder.CreateCondBr(Condition, NullDest, NewExitBridge);
+
+  std::cout << "ENV: Created clean bypass around loop with new basic block" << std::endl;
+
+  // Handle PHI nodes in the exit block
+  for (BasicBlock::iterator I = NullDest->begin(); 
+      PHINode *PN = dyn_cast<PHINode>(I); ++I) {
+    
+    // For each original incoming edge from the loop, we need to update it
+    int LoopEntryIdx = PN->getBasicBlockIndex(NonNullDest);
+    if (LoopEntryIdx != -1) {
+      Value *IncomingValue = PN->getIncomingValue(LoopEntryIdx);
+      
+      // Remove the old incoming edge
+      PN->removeIncomingValue(LoopEntryIdx, false);
+      
+      // Add the new incoming edge from our bridge block
+      PN->addIncoming(IncomingValue, NewExitBridge);
+    }
+    
+    // Also check for other incoming edges from loop blocks
+    for (BasicBlock *BB : L->getBlocks()) {
+      int Idx = PN->getBasicBlockIndex(BB);
+      if (Idx != -1) {
+        Value *IncomingValue = PN->getIncomingValue(Idx);
+        
+        // Remove the old incoming edge
+        PN->removeIncomingValue(Idx, false);
+        
+        // Add new incoming edge from our bridge block
+        PN->addIncoming(IncomingValue, NewExitBridge);
+      }
+    }
+  }
+
+  std::cout << "ENV: Updated PHI nodes in exit block" << std::endl;
+
+}
+
+Function *LoopSpawningImpl::createCilkWalkWrapper(Function *OutlinedFn,
+  const SmallVector<Value*, 8> &LiveInVec,
+  StructType *EnvTy) {
+  LLVMContext &Ctx = OutlinedFn->getContext();
+  Module *M = OutlinedFn->getParent();
+
+  // Determine the type for the "current" node (first parameter of OutlinedFn).
+  Type *NodePtrTy = OutlinedFn->getFunctionType()->getParamType(0);
+  std::cout << "WRAPPER: got node type" << std::endl;
+  // Create a function type for the wrapper: it takes {Node*, EnvTy*} and returns void.
+  SmallVector<Type*, 2> WrapperParamTypes = { NodePtrTy, EnvTy->getPointerTo() };
+  FunctionType *WrapperFT = FunctionType::get(Type::getVoidTy(Ctx), WrapperParamTypes, false);
+  std::cout << "WRAPPER: got wrapper function type" << std::endl;
+  // Create the wrapper function.
+  Function *WrapperFn = Function::Create(WrapperFT, GlobalValue::InternalLinkage,
+  "__cilk_walk_wrapper", M);
+  std::cout << "WRAPPER: created wrapper function" << std::endl;
+  // Create an entry basic block.
+  BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", WrapperFn);
+  IRBuilder<> Builder(EntryBB);
+  std::cout << "WRAPPER: created entry basic block" << std::endl;
+  // Get the wrapper function's parameters.
+  auto ArgIter = WrapperFn->arg_begin();
+  Argument *CurrentArg = &*ArgIter++;
+  Argument *EnvArg = &*ArgIter;
+  std::cout << "WRAPPER: got function parameters" << std::endl;
+  // Prepare arguments for calling the outlined function.
+  SmallVector<Value*, 8> OutlinedCallArgs;
+  OutlinedCallArgs.push_back(CurrentArg); // Dynamic current node.
+  std::cout << "WRAPPER: prepared arguments" << std::endl;
+  // For each live-in, load its value from the environment.
+  for (unsigned i = 0, e = LiveInVec.size(); i < e; ++i) {
+    Value *FieldPtr = Builder.CreateStructGEP(EnvTy, EnvArg, i, "env.field.ptr");
+    Value *LiveInVal = Builder.CreateLoad(EnvTy->getElementType(i), FieldPtr, "env.field");
+    OutlinedCallArgs.push_back(LiveInVal);
+  }
+  std::cout << "WRAPPER: created loads" << std::endl;
+  // Call the outlined function.
+  Builder.CreateCall(OutlinedFn, OutlinedCallArgs);
+  Builder.CreateRetVoid();
+  std::cout << "WRAPPER: created call" << std::endl;
+  return WrapperFn;
+}
+
+
+void LoopSpawningImpl::fixInvokeAndBadReferences(Function *Fn) {
+  LLVMContext &Context = Fn->getContext();
+
+  //
+  // PART 1: Handle invoke instructions (for exception unwinding)
+  //
+  bool foundInvoke = false;
+  for (BasicBlock &BB : *Fn) {
+    for (Instruction &I : BB) {
+      if (isa<InvokeInst>(I)) {
+        foundInvoke = true;
+        break;
+      }
+    }
+    if (foundInvoke)
+      break;
+  }
+  
+  BasicBlock *landingPadBB = nullptr;
+  if (foundInvoke) {
+    landingPadBB = BasicBlock::Create(Context, "fixed.lpad", Fn);
+    
+    // Create a landing pad instruction.
+    // Typically, the landing pad type is { i8*, i32 }.
+    StructType *LPadTy = StructType::get(
+        Context,
+        { PointerType::get(Type::getInt8Ty(Context), 0),
+          Type::getInt32Ty(Context) }
+    );
+    LandingPadInst *lpadInst = LandingPadInst::Create(LPadTy, 0, "lpad", landingPadBB);
+    lpadInst->setCleanup(true);
+    
+    // According to LLVM rules, a landing pad block must be reached only via the unwind edge.
+    // Thus, terminate it with a "resume" instruction.
+    IRBuilder<> LPBuilder(landingPadBB);
+    LPBuilder.CreateResume(lpadInst);
+    
+    // Rewire all invoke instructions to use the new landing pad as their unwind destination.
+    for (BasicBlock &BB : *Fn) {
+      for (Instruction &I : BB) {
+        if (InvokeInst *inv = dyn_cast<InvokeInst>(&I)) {
+          inv->setUnwindDest(landingPadBB);
+          std::cout << "LANDINGPAD: rewired invoke in " << Fn->getName().str() << std::endl;
+        }
+      }
+    }
+    
+    // Set a personality function for exception handling.
+    Module *M = Fn->getParent();
+    Function *personality = cast<Function>(
+        M->getOrInsertFunction("__gxx_personality_v0",
+          FunctionType::get(Type::getInt32Ty(Context), false)
+        ).getCallee()
+    );
+    Fn->setPersonalityFn(personality);
+    std::cout << "LANDINGPAD: set personality for " << Fn->getName().str() << std::endl;
+  }
+
+  //
+  // PART 2: Handle bad references (operands pointing to basic blocks outside Fn)
+  //
+  bool foundBadRef = false;
+  for (BasicBlock &BB : *Fn) {
+    for (Instruction &I : BB) {
+      for (unsigned op = 0, e = I.getNumOperands(); op < e; ++op) {
+        if (BasicBlock *OpBB = dyn_cast<BasicBlock>(I.getOperand(op))) {
+          if (OpBB->getParent() != Fn) {
+            foundBadRef = true;
+            break;
+          }
+        }
+      }
+      if (foundBadRef)
+        break;
+    }
+    if (foundBadRef)
+      break;
+  }
+  
+  BasicBlock *returnBB = nullptr;
+  if (foundBadRef) {
+    returnBB = BasicBlock::Create(Context, "fixed.ret", Fn);
+    IRBuilder<> RetBuilder(returnBB);
+    RetBuilder.CreateRetVoid();
+    
+    // Now update every instruction that has a bad basic block reference.
+    for (BasicBlock &BB : *Fn) {
+      for (Instruction &I : BB) {
+        for (unsigned op = 0, e = I.getNumOperands(); op < e; ++op) {
+          if (BasicBlock *OpBB = dyn_cast<BasicBlock>(I.getOperand(op))) {
+            if (OpBB->getParent() != Fn) {
+              I.setOperand(op, returnBB);
+              std::cout << "BADREF: replaced bad block reference in instruction" << std::endl;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+//---------------------------------------------------------------------
+// outlineCilkWalkLoop: creates the outlined function, clones loop blocks,
+// creates an environment type for live-ins, and builds the wrapper.
+LoopSpawningImpl::OutlinedLoopInfo LoopSpawningImpl::outlineCilkWalkLoop(
+Loop *L, Type *CilkWalkReturnType,
+const DenseSet<Value *> &liveIns, const DenseSet<Value *> &liveOuts) {
+
+  // Convert the unordered live-ins into a fixed-order vector.
+  SmallVector<Value *, 8> LiveInVec;
+  for (Value *LI : liveIns){
+    if (LI ->getType()->isLabelTy()){
+      std::cout << "OUTLINE: Skipping live-in of type label when creating live in vector" << std::endl;
+      continue;
+    }
+    LiveInVec.push_back(LI);
+  }
+  std::cout << "OUTLINE: created live in vector" << std::endl;
+
+  // Sort for deterministic order.
+  std::sort(LiveInVec.begin(), LiveInVec.end(),
+  [](Value *A, Value *B) { return A < B; });
+  std::cout << "OUTLINE: sorted live in vector" << std::endl;
+
+  // Build the argument types for the outlined function:
+  // index 0: CilkWalk return type (i.e. current node), indices 1..N: live-ins.
+  SmallVector<Type *, 8> ArgTypes;
+  ArgTypes.push_back(CilkWalkReturnType);
+  // Also build the environment field types.
+  SmallVector<Type*, 8> EnvFieldTypes;
+  for (Value *LI : LiveInVec) {
+    Type *LITy = LI -> getType();
+    if (LITy->isLabelTy()){
+      std::cout << "OUTLINE: Skipping live-in of type label when creating argtypes and env field type vector" << std::endl;
+      continue;
+    }
+    /* print type 
+    // std::string TypeStr;
+    // llvm::raw_string_ostream OS(TypeStr);
+    // LITy->print(OS);
+    // OS.flush();
+    // std::cout << TypeStr << std::endl;
+    */
+    if (!LITy->isSized()){
+      LITy = LITy->getPointerTo();
+    }
+    ArgTypes.push_back(LI->getType());
+    EnvFieldTypes.push_back(LI->getType());
+  }
+
+  // Create the environment structure type.
+  LLVMContext &Ctx = L->getHeader()->getContext();
+  StructType *EnvTy = StructType::create(Ctx, EnvFieldTypes, "cilk_walk_env");
+  std::cout << "OUTLINE: built arg type and env field type vectors" << std::endl;                                      
+
+  // Create the outlined function type (assume void return).
+  FunctionType *OutlinedFT = FunctionType::get(Type::getVoidTy(Ctx), ArgTypes, false);
+  std::cout << "OUTLINE: created outline function type" << std::endl;
+
+  // Create the outlined function in the parent module.
+  Function *OutlinedFn = Function::Create(OutlinedFT, GlobalValue::InternalLinkage,
+  "cilkWalk_outlined", F.getParent());
+  std::cout << "OUTLINE: created actual outlined function" << std::endl;
+
+  // Clone each block in the loop into OutlinedFn.
+  ValueToValueMapTy VMap;
+  for (BasicBlock *BB : L->getBlocks()) {
+    BasicBlock *ClonedBB = CloneBasicBlock(BB, VMap, BB->getName() + ".cloned", OutlinedFn);
+    VMap[BB] = ClonedBB;
+  }
+  std::cout << "OUTLINE: cloned basic blocks" << std::endl;
+
+  for (BasicBlock &BB : *OutlinedFn) {
+    // Iterate over instructions (using an iterator that allows deletion).
+    for (auto InstIt = BB.begin(), E = BB.end(); InstIt != E; ) {
+      Instruction *Inst = &*InstIt++;
+      if (Inst->getMetadata("cilk.walk") || Inst->getMetadata("cilk.walk.control.flow"))
+        Inst->eraseFromParent();
+    }
+    // After removing unwanted instructions, check if the block has a terminator.
+    if (!BB.getTerminator()){
+      IRBuilder<> TempBuilder(&BB);
+      TempBuilder.CreateRetVoid();
+      std::cout << "OUTLINE: added return value" << std::endl;
+    }
+  }
+  std::cout << "OUTLINE: cleaned up cloned basic blocks to get rid of control flow" << std::endl;
+
+  // Remap instructions in the cloned blocks.
+  for (BasicBlock &ClonedBB : *OutlinedFn) {
+    for (Instruction &Inst : ClonedBB)
+      RemapInstruction(&Inst, VMap, RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+  }
+  std::cout << "OUTLINE: remapped instructions in cloned blocks" << std::endl;
+
+  // Replace uses of each original live-in in OutlinedFn with the corresponding function argument.
+  // The outlined function’s argument order is: 0=current, 1..N=live-ins.
+  unsigned ArgIdx = 1;
+  for (Value *OrigLiveIn : LiveInVec) {
+    if (OrigLiveIn ->getType()->isLabelTy()){
+      std::cout << "OUTLINE: Skipping live-in of type label when creating actual call args" << std::endl;
+      continue;
+    }
+    Argument *Arg = nullptr;
+    unsigned CurIdx = 0;
+    for (Argument &A : OutlinedFn->args()) {
+      if (CurIdx == ArgIdx) {
+        Arg = &A;
+        break;
+      }
+    ++CurIdx;
+    }
+    for (BasicBlock &BB : *OutlinedFn) {
+      for (Instruction &Inst : BB) {
+        Inst.replaceUsesOfWith(OrigLiveIn, Arg);
+      }
+    }
+    ++ArgIdx;
+  }
+  std::cout << "OUTLINE: replaced uses of original live-in with argument" << std::endl;
+
+  // Compute live-out mapping.
+  DenseMap<Value*, Value*> LiveOutMapping;
+  for (Value *OrigLiveOut : liveOuts) {
+    if (VMap.count(OrigLiveOut))
+      LiveOutMapping[OrigLiveOut] = VMap[OrigLiveOut];
+  }
+  std::cout << "OUTLINE: mapped live outs" << std::endl;
+
+  // Instead of inserting a direct call (because the dynamic "current" is not available),
+  // we generate a wrapper function that takes (Node*, EnvTy*) and calls OutlinedFn.
+  Function *WrapperFn = createCilkWalkWrapper(OutlinedFn, LiveInVec, EnvTy);
+  std::cout << "OUTLINE: created wrapper function for cilk_walk" << std::endl;
+
+  // If there are any invokes in this new function, they certainly point to lpad blocks outside
+  // the new function. Fix this. 
+  fixInvokeAndBadReferences(WrapperFn);
+  fixInvokeAndBadReferences(OutlinedFn);
+
+  // Package the outlined function, the wrapper, and live-out mapping into OutlinedLoopInfo.
+  OutlinedLoopInfo OLI;
+  OLI.OutlinedFn = OutlinedFn;
+  OLI.WrapperFn = WrapperFn;
+  OLI.LiveOutMapping = LiveOutMapping;
+  OLI.LiveInVec = LiveInVec;
+  OLI.EnvTy = EnvTy;
+  return OLI;
+}
+
+//---------------------------------------------------------------------
+// getLiveInValues: determine values used in the loop but defined outside.
+DenseSet<Value *> LoopSpawningImpl::getLiveInValues(Loop *L) {
+  DenseSet<Value *> LiveIns;
+  for (BasicBlock *BB : L->getBlocks()) {
+    for (Instruction &I : *BB) {
+      for (Value *Op : I.operands()) {
+        if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
+          if (!L->contains(OpInst->getParent()))
+            LiveIns.insert(Op);
+        } else if (!isa<Constant>(Op)) {
+          LiveIns.insert(Op);
+        }
+      }
+    }
+  }
+  return LiveIns;
+}
+
+//---------------------------------------------------------------------
+// getLiveOutValues: determine values defined in the loop that are used outside.
+DenseSet<Value *> LoopSpawningImpl::getLiveOutValues(Loop *L) {
+  DenseSet<Value *> LiveOuts;
+  for (BasicBlock *BB : L->getBlocks()) {
+    for (Instruction &I : *BB) {
+      for (User *U : I.users()) {
+        if (Instruction *UserInst = dyn_cast<Instruction>(U)) {
+          if (!L->contains(UserInst->getParent())) {
+            LiveOuts.insert(&I);
+            break;
+          }
+        }
+      }
+    }
+  }
+  return LiveOuts;
+}
+
+void LoopSpawningImpl::isolateLoopExceptionHandling(Loop *L, Function *OutlinedFn) {
+  // Get the function containing the loop
+  Function *F = L->getHeader()->getParent();
+  LLVMContext &Ctx = F->getContext();
+  
+  // Step 1: Create an unreachable landing pad for the original loop
+  BasicBlock *LoopIsolatedLPad = BasicBlock::Create(
+      Ctx, 
+      "isolated.lpad.loop", 
+      F
+  );
+  
+  // Step 2: Create an unreachable landing pad for the outlined function
+  BasicBlock *OutlinedIsolatedLPad = BasicBlock::Create(
+      Ctx, 
+      "isolated.lpad.outlined", 
+      OutlinedFn
+  );
+  
+  // Find any existing landingpad instruction to clone its structure
+  LandingPadInst *ExistingLPad = nullptr;
+  for (BasicBlock &BB : *F) {
+    for (Instruction &I : BB) {
+      if (LandingPadInst *LPad = dyn_cast<LandingPadInst>(&I)) {
+        ExistingLPad = LPad;
+        break;
+      }
+    }
+    if (ExistingLPad) break;
+  }
+  
+  // Create the landing pad instruction for the original loop
+  IRBuilder<> LoopBuilder(LoopIsolatedLPad);
+  LandingPadInst *LoopLPad = nullptr;
+  
+  if (ExistingLPad) {
+    // Clone the existing landingpad structure
+    LoopLPad = cast<LandingPadInst>(ExistingLPad->clone());
+    LoopBuilder.Insert(LoopLPad);
+  } else {
+    // Create a simple cleanup landingpad as fallback
+    Type *Int8PtrTy = PointerType::get(Ctx, 0);
+    Type *Int32Ty = Type::getInt32Ty(Ctx);
+    StructType *LPadType = StructType::get(Int8PtrTy, Int32Ty);
+    
+    LoopLPad = LoopBuilder.CreateLandingPad(LPadType, 0);
+    LoopLPad->setCleanup(true);
+  }
+  
+  // Add an unreachable instruction to terminate the loop's landing pad
+  LoopBuilder.CreateUnreachable();
+  
+  // Create the landing pad instruction for the outlined function
+  IRBuilder<> OutlinedBuilder(OutlinedIsolatedLPad);
+  LandingPadInst *OutlinedLPad = nullptr;
+  
+  if (ExistingLPad) {
+    // Clone the existing landingpad structure
+    OutlinedLPad = cast<LandingPadInst>(ExistingLPad->clone());
+    OutlinedBuilder.Insert(OutlinedLPad);
+  } else {
+    // Create a simple cleanup landingpad as fallback
+    Type *Int8PtrTy = PointerType::get(Ctx, 0);
+    Type *Int32Ty = Type::getInt32Ty(Ctx);
+    StructType *LPadType = StructType::get(Int8PtrTy, Int32Ty);
+    
+    OutlinedLPad = OutlinedBuilder.CreateLandingPad(LPadType, 0);
+    OutlinedLPad->setCleanup(true);
+  }
+  
+  // For the outlined function, we need to properly handle the exception
+  // Create a resume instruction to propagate the exception
+  OutlinedBuilder.CreateResume(OutlinedLPad);
+  
+  // Step 3: Redirect all invoke instructions in the original loop to our loop landing pad
+  for (BasicBlock *BB : L->blocks()) {
+    for (Instruction &I : *BB) {
+      if (InvokeInst *Invoke = dyn_cast<InvokeInst>(&I)) {
+        // Redirect this invoke's unwind destination to our loop landing pad
+        Invoke->setUnwindDest(LoopIsolatedLPad);
+      }
+    }
+  }
+  
+  // Step 4: Redirect all invoke instructions in the outlined function to its landing pad
+  for (BasicBlock &BB : *OutlinedFn) {
+    for (Instruction &I : BB) {
+      if (InvokeInst *Invoke = dyn_cast<InvokeInst>(&I)) {
+        // Redirect this invoke's unwind destination to the outlined landing pad
+        Invoke->setUnwindDest(OutlinedIsolatedLPad);
+      }
+    }
+  }
+  
+  std::cout << "EXC: Isolated exception handling for both loop and outlined function" << std::endl;
+}
+
+void LoopSpawningImpl::fixLandingPadPHINodes(Function *F) {
+  // After we've isolated the exception handling and made some landing pads unreachable,
+  // we need to update PHI nodes in downstream blocks to remove incoming values from
+  // unreachable blocks
+  
+  // First, find all landing pad blocks that have no predecessors (unreachable)
+  SmallVector<BasicBlock *, 8> UnreachableLPads;
+  
+  for (BasicBlock &BB : *F) {
+    // Look for landing pad instructions
+    for (Instruction &I : BB) {
+      if (isa<LandingPadInst>(I)) {
+        // Check if this block has any predecessors
+        if (pred_empty(&BB)) {
+          UnreachableLPads.push_back(&BB);
+          break;
+        }
+      }
+    }
+  }
+  
+  if (UnreachableLPads.empty()) {
+    std::cout << "PHI: No unreachable landing pads found" << std::endl;
+    return;
+  }
+  
+  std::cout << "PHI: Found " << UnreachableLPads.size() << " unreachable landing pads" << std::endl;
+  
+  // For each block in the function
+  for (BasicBlock &BB : *F) {
+    // For each PHI node in the block
+    for (BasicBlock::iterator BBI = BB.begin(); isa<PHINode>(BBI); ++BBI) {
+      PHINode *PN = cast<PHINode>(BBI);
+      
+      // Check if this PHI node references any of our unreachable landing pads
+      for (BasicBlock *UnreachableBB : UnreachableLPads) {
+        // Find incoming value index for this unreachable block
+        int Idx = PN->getBasicBlockIndex(UnreachableBB);
+        if (Idx != -1) {
+          // Remove the incoming value from the unreachable block
+          PN->removeIncomingValue(Idx, false);
+          std::cout << "PHI: Removed incoming value from unreachable landing pad" << std::endl;
+        }
+      }
+    }
+  }
+  
+  std::cout << "PHI: Fixed landing pad PHI nodes" << std::endl;
+}
+
+//---------------------------------------------------------------------
+// processCilkWalkLoop: find the cilk.walk/cilk.begin_walk calls,
+// compute live-ins/outs, and perform outlining.
+bool LoopSpawningImpl::processCilkWalkLoop(Loop *L) {
+  // Variables to store found function references.
+  Value *CilkWalkFnRef = nullptr;
+  CallInst *CilkWalkCall = nullptr;
+  Type *CilkWalkReturnType = nullptr;
+  CallInst *CilkBeginWalkCall = nullptr;
+  Value *CilkBeginWalkFnRef = nullptr;
+
+
+
+  
+  // Look for the cilk.walk and cilk.begin_walk calls.
+  for (BasicBlock &BB : F) {
+    if (CilkWalkCall && CilkBeginWalkCall)
+      break;
+    for (Instruction &I : BB) {
+      if (CilkWalkCall && CilkBeginWalkCall)
+        break;
+      if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+        if (CI->getMetadata("cilk.walk")) {
+          CilkWalkCall = CI;
+          CilkWalkReturnType = CI->getType();
+          CilkWalkFnRef = CI->getCalledOperand();
+          std::cout << "Found call with cilk.walk metadata and updated CilkWalkFnRef" << std::endl;
+          break;
+        } else if (CI->getMetadata("cilk.begin_walk")) {
+          CilkBeginWalkFnRef = CI->getCalledOperand();
+          CilkBeginWalkCall = CI;
+          std::cout << "Found call with cilk.begin_walk metadata and updated CilkBeginWalkFnRef" << std::endl;
+        }
+      }
+    }
+  }
+
+  if (!CilkWalkFnRef) {
+    std::cout << "Error: Could not find CilkWalk function reference" << std::endl;
     return false;
+  }
+
+  if (!CilkBeginWalkFnRef) {
+    std::cout << "Error: Could not find CilkBeginWalk function reference" << std::endl;
+    return false;
+  }
+
+  // Get live-ins and live-outs for the loop.
+  DenseSet<Value *> liveIns = getLiveInValues(L);
+  std::cout << "PROCESS: Got live in values" << std::endl;
+  DenseSet<Value *> liveOuts = getLiveOutValues(L);
+  std::cout << "PROCESS: Got live out values" << std::endl;
+
+  // Outline the loop body.
+  OutlinedLoopInfo outlinedLoopInfo = outlineCilkWalkLoop(L, CilkWalkReturnType, liveIns, liveOuts);
+  std::cout << "PROCESS: Outlined Cilk Walk Loop" << std::endl;
+
+  // Rewrite the call site (e.g. in CilkBeginWalk)
+  // to pass the wrapper function pointer (outlinedLoopInfo.WrapperFn) along with
+  // an environment pointer (which you would allocate and populate in the parent function).
+  insertEnvironmentAllocationAndCall(
+    L, 
+    outlinedLoopInfo.WrapperFn, 
+    outlinedLoopInfo.LiveInVec,  
+    outlinedLoopInfo.EnvTy,      
+    CilkBeginWalkCall);
+
+  // // // Ensure exception handling paths for outlined loop body function and original loop don't merge 
+  // // // This ensures a control flow can be properly analyzed
+  // isolateLoopExceptionHandling(L, outlinedLoopInfo.OutlinedFn);
+
+  // // fixLandingPadPHINodes(L->getHeader()->getParent());
+  // fixUnreachableBlockTerminators(L->getHeader()->getParent());
+
+  // Module* M = outlinedLoopInfo.OutlinedFn->getParent();
+  // // add personality for new landing pads
+  // Function* personality = cast<Function>(
+  //   M->getOrInsertFunction("__gxx_personality_v0",
+  //       FunctionType::get(Type::getInt32Ty(M->getContext()), false)
+  //   ).getCallee()
+  // );
+  
+  // // Make sure the type is correct: often a cast<Function> is enough
+  // // Then set the function’s personality:
+  // outlinedLoopInfo.OutlinedFn->setPersonalityFn(personality);
+
+
+  // if (llvm::verifyFunction(F, &llvm::errs())) {
+  //   std::cout << "Original Function is broken!" << std::endl;
+  //   // You could abort here or otherwise handle the error
+  // }
+  // if (llvm::verifyFunction(*outlinedLoopInfo.OutlinedFn, &llvm::errs())) {
+  //   std::cout << "Outlined Function is broken!" << std::endl;
+  //   // You could abort here or otherwise handle the error
+  // }
+  // if (llvm::verifyFunction(*outlinedLoopInfo.WrapperFn, &llvm::errs())) {
+  //   std::cout << "Wrapper Function is broken!" << std::endl;
+  //   // You could abort here or otherwise handle the error
+  // }
+
+  return true;
+}
+
+void LoopSpawningImpl::deleteBlock(llvm::StringRef blockName) {
+  // Find the block you want to eliminate
+  BasicBlock *blockToRemove = nullptr;
+  for (BasicBlock &BB : F) {
+    if (BB.getName() == blockName) {
+      blockToRemove = &BB;
+      std::cout << "found " << blockName.str() << std::endl;
+      break;
+    }
+  }
+
+  if (blockToRemove) {
+    unsigned successors = blockToRemove->getTerminator()->getNumSuccessors();
+    BasicBlock *successor = nullptr;
+    if (successors > 0){
+
+      successor = blockToRemove->getTerminator()->getSuccessor(0);
+      
+      // Copy the predecessors since we'll modify the CFG while iterating.
+      std::vector<BasicBlock*> preds(predecessors(blockToRemove).begin(),
+                                      predecessors(blockToRemove).end());
+      
+      // Redirect all predecessors to point to the successor instead
+      for (BasicBlock *pred : preds) {
+        Instruction *terminator = pred->getTerminator();
+        for (unsigned i = 0; i < terminator->getNumSuccessors(); i++) {
+          if (terminator->getSuccessor(i) == blockToRemove)
+            terminator->setSuccessor(i, successor);
+        }
+      }
+    }
+    // Now remove the block's instructions and delete it
+    blockToRemove->dropAllReferences();  // Remove references to other blocks/values
+    blockToRemove->eraseFromParent();      // Delete the block from the function
+    if (successors > 0){
+      // Update PHI nodes in the successor block: remove incoming values from the deleted block
+      for (PHINode &PN : successor->phis())
+        PN.removeIncomingValue(blockToRemove, false);
+    }
+  }
+}
+
+
+
+void LoopSpawningImpl::fixUnreachableBlockTerminators(Function *F) {
+  // Find all unreachable blocks and replace their terminators with unreachable instructions
+  // This makes the control flow graph consistent by ensuring unreachable blocks don't
+  // have outgoing edges
+  
+  SmallVector<BasicBlock *, 8> UnreachableBlocks;
+  
+  // Identify unreachable blocks (those with no predecessors)
+  for (BasicBlock &BB : *F) {
+    if (pred_empty(&BB)) {
+      // Skip entry block which naturally has no predecessors
+      if (&BB == &F->getEntryBlock())
+        continue;
+        
+      UnreachableBlocks.push_back(&BB);
+    }
+  }
+  
+  if (UnreachableBlocks.empty()) {
+    std::cout << "CFG: No unreachable blocks found" << std::endl;
+    return;
+  }
+  
+  std::cout << "CFG: Found " << UnreachableBlocks.size() << " unreachable blocks" << std::endl;
+  
+  // For each unreachable block
+  for (BasicBlock *BB : UnreachableBlocks) {
+    // Get the terminator
+    Instruction *Term = BB->getTerminator();
+    if (!Term) continue;
+    
+    // Get all successor blocks
+    SmallVector<BasicBlock *, 4> Succs;
+    for (unsigned i = 0; i < Term->getNumSuccessors(); ++i) {
+      Succs.push_back(Term->getSuccessor(i));
+    }
+    
+    // Remove terminator
+    Term->eraseFromParent();
+    
+    // Create new unreachable instruction
+    new UnreachableInst(BB->getContext(), BB);
+    
+    // Update PHI nodes in all former successors
+    for (BasicBlock *Succ : Succs) {
+      // Look for PHI nodes
+      for (BasicBlock::iterator I = Succ->begin(); isa<PHINode>(I); ++I) {
+        PHINode *PN = cast<PHINode>(I);
+        
+        // Remove incoming value from this unreachable block
+        int Idx = PN->getBasicBlockIndex(BB);
+        if (Idx != -1) {
+          PN->removeIncomingValue(Idx, false);
+          std::cout << "CFG: Removed incoming value from unreachable block in PHI node" << std::endl;
+        }
+      }
+    }
+  }
+  
+  std::cout << "CFG: Fixed unreachable block terminators" << std::endl;
+}
+
+bool LoopSpawningImpl::run() {
+  
+  for (Loop *TopLevelLoop : LI) {
+    for (Loop *L : post_order(TopLevelLoop)){
+      bool HasCilkWalkMetadata = false;
+        for (BasicBlock *BB : L->blocks()) {
+          for (Instruction &I : *BB) {
+            if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+              if (CI->getMetadata("cilk.walk")) {
+                std::cout << "Found cilk.walk metadata in loop!" << std::endl;
+                HasCilkWalkMetadata = true;
+                break;
+              }
+            }
+          }
+          if (HasCilkWalkMetadata){ 
+            if (processCilkWalkLoop(L)){
+              // for (auto I = LI.begin(), E = LI.end(); I != E; ++I) {
+              //   if (*I == L) { 
+              //     // removeLoop() wants an iterator
+              //     LI.removeLoop(I);
+              //     std::cout << "Deleted loop" << std::endl;
+              //     deleteBlock("cilk.for.end.loopexit");
+              //     deleteBlock("invoke.cont7");
+              //     deleteBlock("cilk.for.cond");
+              //     deleteBlock("cilk.for.cond.preheader");
+              //     deleteBlock("lpad6.loopexit");
+              //     deleteBlock("isolated.lpad.loop");
+              //     return true;
+              //     break;
+              //   }
+              // }
+              std::cout << "processed changed stuff" << std::endl;
+              return true;
+            }
+            break;
+        }
+        if (HasCilkWalkMetadata){ 
+            break;
+        }
+      }
+    }
+  }
+
+  if (TI.isSerial()){
+    std::cout << "LOOPSPAWNING: serial" << std::endl;
+    return false;
+  }
 
   // Discover all Tapir loops and record them.
-  for (Loop *TopLevelLoop : LI)
+  for (Loop *TopLevelLoop : LI) {
+    std::cout << "loop found" << std::endl;
     for (Loop *L : post_order(TopLevelLoop))
       if (Task *T = getTaskIfTapirLoop(L))
         createTapirLoop(L, T);
-
+  }
   if (TapirLoops.empty())
     return false;
 
