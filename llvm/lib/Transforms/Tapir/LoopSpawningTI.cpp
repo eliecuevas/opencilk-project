@@ -1807,6 +1807,8 @@ void LoopSpawningImpl::insertBypassLogicForInvoke(InvokeInst *NewInvoke,
 
 void LoopSpawningImpl::switchOutlinedLoopVarInitialization(Loop *L, Function *OutlinedFn) {
   bool done = false;
+  Value *destinationPtr = nullptr; // Variable to store the destination pointer
+  
   for (BasicBlock *BB : L->getBlocks()) {
     for (Instruction &I : *BB) {
       for (Value *Op : I.operands()) {
@@ -1815,25 +1817,33 @@ void LoopSpawningImpl::switchOutlinedLoopVarInitialization(Loop *L, Function *Ou
             // we need to change the dummy loop var initialization uses in the outlined function 
             // to go from waiting for the result from CilkBeginWalk (placeholder) to accepting the
             // first parameter (ptr %0 probably)
+            
             // Get the first argument of the outlined function
             if (OutlinedFn->arg_empty()) {
-              // Error handling if no arguments exist
-              std::cerr << "Error: Outlined function has no arguments" << std::endl;
+              std::cout << "Error: Outlined function has no arguments" << std::endl;
               return;
             }
             Argument *FirstArg = OutlinedFn->arg_begin();
+            
             // Find all uses of the CilkBeginWalk instruction in the outlined function
-            // and replace them with the first argument
             for (User *U : OpInst->users()) {
-              if (Instruction *UseInst = dyn_cast<Instruction>(U)) {
+              if (CallInst *CallI = dyn_cast<CallInst>(U)) {
+                // Check if this is the memcpy call
+                Function *Callee = CallI->getCalledFunction();
+                if (Callee && Callee->getName().starts_with("llvm.memcpy")) {
+                  // This is the memcpy call - get the destination pointer (first arg)
+                  destinationPtr = CallI->getArgOperand(0);
+                }
+                
                 // Check if this instruction is in the outlined function
-                if (UseInst->getFunction() == OutlinedFn) {
+                if (CallI->getFunction() == OutlinedFn) {
                   // Replace the use with the first argument
-                  UseInst->replaceUsesOfWith(OpInst, FirstArg);
+                  CallI->replaceUsesOfWith(OpInst, FirstArg);
                   std::cout << "Replaced use of CilkBeginWalk result with function argument" << std::endl;
                 }
               }
             }
+            
             done = true;
             break; // Found and processed the cilk.begin_walk, break from operands loop
           }
@@ -1843,6 +1853,67 @@ void LoopSpawningImpl::switchOutlinedLoopVarInitialization(Loop *L, Function *Ou
     }
     if (done) break; // Break from basic blocks loop
   }
+  
+  if (!destinationPtr) {
+    std::cout << "SWITCH: could not found destination pointer" << std::endl;
+    return;
+  } 
+
+  // Now find stores to the destination pointer in the outlined function
+  // and duplicate them to also store to the first argument
+  Argument *FirstArg = OutlinedFn->arg_begin();
+  std::vector<StoreInst*> storesToDuplicate;
+  
+  // First, collect all store instructions to the destination
+  for (BasicBlock &BB : *OutlinedFn) {
+    for (Instruction &I : BB) {
+      if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {
+        // Check if this store is to our destination pointer
+        // We need to account for both direct stores and GEP-based stores
+        Value *StorePtr = SI->getPointerOperand();
+        bool isStoreToDestination = false;
+        
+        if (StorePtr == destinationPtr) {
+          isStoreToDestination = true;
+        } else if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(StorePtr)) {
+          // Check if the GEP's base pointer is our destination
+          if (GEP->getPointerOperand() == destinationPtr) {
+            isStoreToDestination = true;
+          }
+        }
+        
+        if (isStoreToDestination) {
+          storesToDuplicate.push_back(SI);
+          std::cout << "Found store to duplicate" << std::endl;
+        }
+      }
+    }
+  }
+  // Now duplicate all stores, placing the duplicates after the originals
+  IRBuilder<> Builder(OutlinedFn->getContext());
+  for (StoreInst *SI : storesToDuplicate) {
+    Builder.SetInsertPoint(SI->getNextNode());
+    
+    // For direct stores, duplicate is simple
+    if (SI->getPointerOperand() == destinationPtr) {
+      Builder.CreateStore(SI->getValueOperand(), FirstArg, SI->isVolatile());
+      std::cout << "Created duplicate store to first argument" << std::endl;
+    } 
+    // For GEP-based stores, we need to create a corresponding GEP
+    else if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand())) {
+      // Create a similar GEP but using FirstArg as base
+      std::vector<Value*> Indices;
+      for (auto Idx = GEP->idx_begin(); Idx != GEP->idx_end(); ++Idx) {
+        Indices.push_back(*Idx);
+      }
+      
+      Value *NewGEP = Builder.CreateGEP(GEP->getSourceElementType(), FirstArg, Indices);
+      Builder.CreateStore(SI->getValueOperand(), NewGEP, SI->isVolatile());
+      std::cout << "Created duplicate GEP + store to first argument" << std::endl;
+    }
+  }
+  
+  std::cout << "Finished duplicating " << storesToDuplicate.size() << " stores" << std::endl;
 }
 
 
