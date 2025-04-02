@@ -497,6 +497,7 @@ public:
     Function *OutlinedFn;
     Function *WrapperFn;
     DenseMap<Value*, Value*> LiveOutMapping;
+    DenseMap<Value *, unsigned> LiveOutEnvMapping;
     SmallVector<Value *, 8> LiveInVec;
     StructType *EnvTy;  
   };
@@ -511,6 +512,7 @@ public:
     Loop *L, 
     Function *WrapperFn, 
     SmallVector<Value *, 8> &LiveInVec, 
+    DenseMap<Value*, unsigned> LiveOutEnvMapping,
     StructType *EnvTy,
     CallBase *BeginWalkCall);
 
@@ -528,7 +530,9 @@ public:
 
   void insertBypassLogicForInvoke(InvokeInst *NewInvoke, BasicBlock *NormalDest, Loop *L);
 
-  void switchOutlinedLoopVarInitialization(Loop *L, Function *OutlinedFn);
+  void switchOutlinedLoopVarInitialization(Loop *L, Function *OutlinedFn,
+                                                DenseMap<Value*, Value*> LiveOutMapping,
+                                                DenseMap<Value *, unsigned> LiveOutEnvMapping);
 
   Function *createCilkWalkWrapper(Function *OutlinedFn, const SmallVector<Value*, 8> &LiveInVec, StructType *EnvTy);
 
@@ -1709,103 +1713,54 @@ TaskOutlineMapTy LoopSpawningImpl::outlineAllTapirLoops() {
 void LoopSpawningImpl::insertBypassLogicForInvoke(InvokeInst *NewInvoke,
                                 BasicBlock *NormalDest,
                                 Loop *L) {
-  // 1) Gather the loop exit blocks (like in your original call-case code).
-  SmallVector<BasicBlock *, 8> ExitBlocks;
-  L->getExitBlocks(ExitBlocks);
-  if (ExitBlocks.empty()) {
-    std::cout << "ENV [INVOKE]: Warning: No loop exit blocks found" << std::endl;
-    return;
-  }
 
-  // Get the first non-landingpad exit block
-  BasicBlock *NullDest = nullptr;
-  for (BasicBlock *Candidate : ExitBlocks) {
-    // Is this block purely a landing pad?
-    bool IsLandingPadBlock = false;
 
-    for (Instruction &Inst : *Candidate) {
-      // Skip any PHI nodes at the start
-      if (isa<PHINode>(Inst))
-        continue;
-
-      // If the first non-PHI instruction is a landingpad, it's a landing-pad block
-      if (isa<LandingPadInst>(Inst)) {
-        IsLandingPadBlock = true;
-      }
-      // Once we see a non-phi and non-landingpad, we can break out of the loop
-      break;
-    }
-
-    if (!IsLandingPadBlock) {
-      NullDest = Candidate;
-      break;
-    }
-  }
-
-  // 2) Insert instructions at the start of NormalDest to do the `isNull` check
-  //    on the return value of the invoke.
-  //    The return value of the invoke is `NewInvoke` itself (an Instruction*).
-  //    If the invoked function returns a pointer, `NewInvoke` is also a Value*.
   IRBuilder<> Builder(&*NormalDest->begin()); 
-  Value *RetVal = NewInvoke; // The pointer returned by the function
-  Value *IsNull = Builder.CreateIsNull(RetVal, "isNull");
+  Value *RetVal = NewInvoke;
+  Value *isNull = Builder.CreateIsNull(RetVal, "isNull");
 
-  // 3) Create a new block that will "bypass" the loop.  We'll unconditionally
-  //    branch from there to the exit block.  Insert it before the NullDest
-  //    so that it flows nicely in CFG order.
-  Function *F = NormalDest->getParent();
-  BasicBlock *BypassBlock = BasicBlock::Create(
-      F->getContext(),
-      "cilk.bypassed.loop.invoke",
-      F,
-      /*InsertBefore=*/NullDest
-  );
-  IRBuilder<> BypassBuilder(BypassBlock);
-  BypassBuilder.CreateBr(NullDest);
 
-  // 4) Now convert NormalDest's block terminator into a conditional branch.
-  //    The block *probably* had a default terminator (like a jump into the loop).
-  //    We'll override that to do:
-  //       if (isNull) goto NullDest else goto BypassBlock
-  //
-  //    So, remove the old terminator first (if it exists).
-  if (NormalDest->getTerminator())
-    NormalDest->getTerminator()->eraseFromParent();
+  BasicBlock *ContinuationBlock = nullptr;
+  if (NormalDest->getTerminator()){
+    if (BranchInst *BI = dyn_cast<BranchInst>(NormalDest->getTerminator())) {
+      // getSuccessor(0) is for the true condition,
+      // getSuccessor(1) is for the false condition.
+      ContinuationBlock = BI->getSuccessor(0);
+      // Now you have the basic block for the true branch.
+      BI->eraseFromParent();
+    }
+  }
+
+
 
   Builder.SetInsertPoint(NormalDest);
-  Builder.CreateCondBr(IsNull, 
-                       /*TrueDest=*/BypassBlock, 
-                       /*FalseDest=*/BypassBlock);
 
-  // 5) Fix up PHI nodes in NullDest (and possibly other exit blocks) so that
-  //    all references that used to come from NormalDest or other loop blocks
-  //    are replaced with BypassBlock. This is the same logic as your call-case:
-  for (auto &I : *NullDest) {
-    if (PHINode *PN = dyn_cast<PHINode>(&I)) {
-      // For each incoming from NormalDest, or from blocks in L->getBlocks(),
-      // remove it and add an incoming from BypassBlock with the same value.
-      int idx = -1;
-      while ((idx = PN->getBasicBlockIndex(NormalDest)) != -1) {
-        Value *IncomingVal = PN->getIncomingValue(idx);
-        PN->removeIncomingValue(idx, false);
-        PN->addIncoming(IncomingVal, BypassBlock);
-      }
-      // Possibly also remove references from other loop blocks the same way
-      for (BasicBlock *BB : L->getBlocks()) {
-        int loopIdx = -1;
-        while ((loopIdx = PN->getBasicBlockIndex(BB)) != -1) {
-          Value *IncomingVal = PN->getIncomingValue(loopIdx);
-          PN->removeIncomingValue(loopIdx, false);
-          PN->addIncoming(IncomingVal, BypassBlock);
-        }
+  // Need to get the other predecessor of Continuation Block
+  // That's the loop exit block which carries our live-in information
+  // We need to make the is not null branch of the CilkBeginWalk call point here
+  // Then we add an incoming phi for that value, which is the same as the one already there (because the phi nodes are replaced already)
+
+  BasicBlock *OtherPred = nullptr;
+
+  for (BasicBlock *Pred : llvm::predecessors(ContinuationBlock)) {
+    if (Pred == NormalDest) continue;
+    for (PHINode &PN : Pred->phis()) {
+      if (PN.getNumIncomingValues() > 0){
+        Value *IncomingVal = PN.getIncomingValue(0);
+        PN.addIncoming(IncomingVal, NormalDest);
       }
     }
+    OtherPred = Pred;
+    break; // key assumption: assuming there are only two predecessors to normal dest
   }
 
-  std::cout << "ENV [INVOKE]: Created clean bypass around loop with new BB and updated PHIs\n";
+  Builder.CreateCondBr(isNull, ContinuationBlock, OtherPred);
+
+  std::cout << "ENV [INVOKE]: Created clean bypass around loop\n";
 }
 
-void LoopSpawningImpl::switchOutlinedLoopVarInitialization(Loop *L, Function *OutlinedFn) {
+void LoopSpawningImpl::switchOutlinedLoopVarInitialization(Loop *L, Function *OutlinedFn, DenseMap<Value*, Value*> LiveOutMapping,
+            DenseMap<Value *, unsigned> LiveOutEnvMapping) {
   bool done = false;
   Value *destinationPtr = nullptr; // Variable to store the destination pointer
   
@@ -1861,6 +1816,9 @@ void LoopSpawningImpl::switchOutlinedLoopVarInitialization(Loop *L, Function *Ou
 
   // Now find stores to the destination pointer in the outlined function
   // and duplicate them to also store to the first argument
+  // at this point, the only stores to the destination pointer are there for the 
+  // actual node argument. None of the other live-outs' stores have been inserted yet
+  // whenever we do find that value, we can identify which part of the env is the "node"
   Argument *FirstArg = OutlinedFn->arg_begin();
   std::vector<StoreInst*> storesToDuplicate;
   
@@ -1914,6 +1872,63 @@ void LoopSpawningImpl::switchOutlinedLoopVarInitialization(Loop *L, Function *Ou
   }
   
   std::cout << "Finished duplicating " << storesToDuplicate.size() << " stores" << std::endl;
+
+  // now need to add stores for every live-out value. we have a mapping on liveouts to environment indices
+  // need to go through outlined instructions, find the declaration of the cloned version of the live-outs, 
+  // and then put those in the environment at the correct index
+  // IGNORE destinationPtr as that should have already been taken care of 
+  // Assume that the environment pointer is the second argument of OutlinedFn.
+  auto argIter = OutlinedFn->arg_begin();
+  if (argIter == OutlinedFn->arg_end()) {
+    std::cerr << "Error: Outlined function has no arguments" << std::endl;
+    return;
+  }
+  ++argIter;  // Move to the second argument.
+  if (argIter == OutlinedFn->arg_end()) {
+    std::cerr << "Error: Outlined function has no environment pointer argument" << std::endl;
+    return;
+  }
+  Argument *EnvPtr = &*argIter;
+
+  // Iterate over all instructions in OutlinedFn.
+  for (BasicBlock &BB : *OutlinedFn) {
+    for (Instruction &I : BB) {
+      // If the current instruction defines a cloned live-out value, insert the store right after it.
+      if (LiveOutMapping.count(&I) && &I != destinationPtr) {
+        // Retrieve the corresponding original live-out.
+        Value *OrigLiveOut = LiveOutMapping[&I];
+
+        // Look up the environment index for this original live-out.
+        auto envIt = LiveOutEnvMapping.find(OrigLiveOut);
+        if (envIt == LiveOutEnvMapping.end())
+          continue;  // Skip if there is no environment index mapping.
+
+        unsigned envIndex = envIt->second;
+
+        // Set up an IRBuilder using the context from the defining instruction.
+        IRBuilder<> Builder(&I);
+        // Try to get the next instruction after I.
+        Instruction *InsertPoint = I.getNextNode();
+        // If the next instruction is either non-existent or a PHI node, then find the first non-PHI.
+        if (!InsertPoint || isa<PHINode>(InsertPoint)) {
+            InsertPoint = I.getParent()->getFirstNonPHI();
+        }
+        Builder.SetInsertPoint(InsertPoint);
+        
+        // The type of the live-out value.
+        Type *liveOutType = I.getType();
+        // Cast the environment pointer to a pointer of the live-out type.
+        Value *castEnvPtr = Builder.CreateBitCast(EnvPtr, liveOutType->getPointerTo());
+        // Compute the pointer to the environment slot using a GEP.
+        Value *indexVal = Builder.getInt32(envIndex);
+        Value *envSlotPtr = Builder.CreateGEP(liveOutType, castEnvPtr, indexVal);
+        // Insert a store that writes the cloned live-out value into the environment slot.
+        Builder.CreateStore(&I, envSlotPtr);
+
+        std::cout << "Inserted store for live-out value in env " << std::endl;
+      }
+    }
+  }
 }
 
 
@@ -1921,6 +1936,7 @@ void LoopSpawningImpl::insertEnvironmentAllocationAndCall(
   Loop *L, 
   Function *WrapperFn, 
   SmallVector<Value *, 8> &LiveInVec, 
+  DenseMap<Value*, unsigned> LiveOutEnvMapping,
   StructType *EnvTy,
   CallBase *BeginWalkCall) {
 
@@ -2055,6 +2071,21 @@ void LoopSpawningImpl::insertEnvironmentAllocationAndCall(
     std::cout << "ENV[INVOKE]: Environment allocation and CilkBeginWalk invoke inserted" << std::endl;
     insertBypassLogicForInvoke(NewInvoke, NormalDest, L);
 
+    // Set insertion point after the invoke's normal destination.
+    IRBuilder<> PostCallBuilder(NormalDest->getFirstNonPHI());
+    // --- Load live-out values from the environment ---
+    for (auto &LOEntry : LiveOutEnvMapping) {
+      Value *OrigLiveOut = LOEntry.first;
+      unsigned fieldIndex = LOEntry.second;
+      // Create a pointer to the live-out's field.
+      Value *FieldPtr = PostCallBuilder.CreateStructGEP(EnvTy, EnvAlloca, fieldIndex, "liveout.ptr");
+      // Load the final live-out value.
+      Value *LoadedLiveOut = PostCallBuilder.CreateLoad(EnvTy->getElementType(fieldIndex), FieldPtr, "liveout.load");
+      // Replace uses of the original live-out with the loaded value.
+      // (In practice, you might restrict replacement to uses after the call.)
+      OrigLiveOut->replaceAllUsesWith(LoadedLiveOut);
+      std::cout << "ENV[INVOKE]: loads of live-outs inserted after call" << std::endl;
+    }
 
   } else {
     std::cout << "ENV [CALL]: cilkBeginWalk was a call not an invoke" << std::endl;
@@ -2156,6 +2187,18 @@ void LoopSpawningImpl::insertEnvironmentAllocationAndCall(
     }
 
     std::cout << "ENV [CALL]: Updated PHI nodes in exit block" << std::endl;
+    // --- NEW STEP: After the call returns, load live-out values ---
+    // Set insertion point to the beginning of the exit block (NullDest).
+    IRBuilder<> PostCallBuilder(NullDest->getFirstNonPHI());
+    for (auto &LOEntry : LiveOutEnvMapping) {
+      Value *OrigLiveOut = LOEntry.first;
+      unsigned fieldIndex = LOEntry.second;
+      Value *FieldPtr = PostCallBuilder.CreateStructGEP(EnvTy, EnvAlloca, fieldIndex, "liveout.ptr");
+      Value *LoadedLiveOut = PostCallBuilder.CreateLoad(EnvTy->getElementType(fieldIndex), FieldPtr, "liveout.load");
+      // Replace uses of the original live-out with the loaded value.
+      OrigLiveOut->replaceAllUsesWith(LoadedLiveOut);
+    }
+    std::cout << "ENV [CALL]: Loaded live-out values and updated uses" << std::endl;
   }
 }
 
@@ -2186,15 +2229,10 @@ Function *LoopSpawningImpl::createCilkWalkWrapper(Function *OutlinedFn,
   Argument *EnvArg = &*ArgIter;
   std::cout << "WRAPPER: got function parameters" << std::endl;
   // Prepare arguments for calling the outlined function.
-  SmallVector<Value*, 8> OutlinedCallArgs;
+  SmallVector<Value*, 2> OutlinedCallArgs;
   OutlinedCallArgs.push_back(CurrentArg); // Dynamic current node.
+  OutlinedCallArgs.push_back(EnvArg);
   std::cout << "WRAPPER: prepared arguments" << std::endl;
-  // For each live-in, load its value from the environment.
-  for (unsigned i = 0, e = LiveInVec.size(); i < e; ++i) {
-    Value *FieldPtr = Builder.CreateStructGEP(EnvTy, EnvArg, i, "env.field.ptr");
-    Value *LiveInVal = Builder.CreateLoad(EnvTy->getElementType(i), FieldPtr, "env.field");
-    OutlinedCallArgs.push_back(LiveInVal);
-  }
   std::cout << "WRAPPER: created loads" << std::endl;
   // Call the outlined function.
   Builder.CreateCall(OutlinedFn, OutlinedCallArgs);
@@ -2307,7 +2345,7 @@ void LoopSpawningImpl::fixInvokeAndBadReferences(Function *Fn) {
 
 //---------------------------------------------------------------------
 // outlineCilkWalkLoop: creates the outlined function, clones loop blocks,
-// creates an environment type for live-ins, and builds the wrapper.
+// creates an environment type for live-ins and live-outs, and builds the wrapper.
 LoopSpawningImpl::OutlinedLoopInfo LoopSpawningImpl::outlineCilkWalkLoop(
 Loop *L, Type *CilkWalkReturnType,
 const DenseSet<Value *> &liveIns, const DenseSet<Value *> &liveOuts) {
@@ -2325,13 +2363,23 @@ const DenseSet<Value *> &liveIns, const DenseSet<Value *> &liveOuts) {
 
   // Sort for deterministic order.
   std::sort(LiveInVec.begin(), LiveInVec.end(),
-  [](Value *A, Value *B) { return A < B; });
+      [](Value *A, Value *B) { return A < B; });
   std::cout << "OUTLINE: sorted live in vector" << std::endl;
 
-  // Build the argument types for the outlined function:
-  // index 0: CilkWalk return type (i.e. current node), indices 1..N: live-ins.
-  SmallVector<Type *, 8> ArgTypes;
-  ArgTypes.push_back(CilkWalkReturnType);
+  // --- Build additional live-outs (those not in liveIns) ---
+  SmallVector<Value*, 8> AdditionalLiveOutVec;
+  for (Value *LO : liveOuts) {
+    if (liveIns.count(LO) == 0) { // Only add if not already a live-in.
+      AdditionalLiveOutVec.push_back(LO);
+    }
+  }
+  std::sort(AdditionalLiveOutVec.begin(), AdditionalLiveOutVec.end(),
+            [](Value *A, Value *B) { return A < B; });
+  std::cout << "OUTLINE: created and sorted additional live-out vector" << std::endl;
+
+  // This keeps track of where in the environment live-out values are
+  DenseMap<Value*, unsigned> LiveOutEnvMapping;
+
   // Also build the environment field types.
   SmallVector<Type*, 8> EnvFieldTypes;
   for (Value *LI : LiveInVec) {
@@ -2340,27 +2388,42 @@ const DenseSet<Value *> &liveIns, const DenseSet<Value *> &liveOuts) {
       std::cout << "OUTLINE: Skipping live-in of type label when creating argtypes and env field type vector" << std::endl;
       continue;
     }
-    /* print type 
-    // std::string TypeStr;
-    // llvm::raw_string_ostream OS(TypeStr);
-    // LITy->print(OS);
-    // OS.flush();
-    // std::cout << TypeStr << std::endl;
-    */
     if (!LITy->isSized()){
       LITy = LITy->getPointerTo();
+      std::cout << "OUTLINE: WARNING, unsized live-in" << std::endl;
+
     }
     std::cerr << "OUTLINE: Real live in type:" << std::endl;
     LITy->dump();
-    ArgTypes.push_back(LI->getType());
     EnvFieldTypes.push_back(LI->getType());
+    if (liveOuts.count(LI) != 0){
+      // this value is a live-out and a live in 
+      // it will not be in AdditionalLiveOutVec
+      // record it's env index now
+      LiveOutEnvMapping[LI] = EnvFieldTypes.size()-1;
+    }
+  }
+  for (Value *LO: AdditionalLiveOutVec){
+    Type *LOTY = LO -> getType();
+    if (LOTY->isLabelTy()){
+      std::cout << "OUTLINE: Skipping liveout of type label when creating env field type vector" << std::endl;
+      continue;
+    }
+    if (!LOTY->isSized()){
+      LOTY = LOTY->getPointerTo();
+    }
+    std::cerr << "OUTLINE: Real live out type:" << std::endl;
+    LOTY->dump();
+    EnvFieldTypes.push_back(LO->getType());
+    LiveOutEnvMapping[LO] = EnvFieldTypes.size()-1;
   }
 
   // Create the environment structure type.
   LLVMContext &Ctx = L->getHeader()->getContext();
   StructType *EnvTy = StructType::create(Ctx, EnvFieldTypes, "cilk_walk_env");
-  std::cout << "OUTLINE: built arg type and env field type vectors" << std::endl;                                      
-
+  std::cout << "OUTLINE: built arg type and env field type vectors" << std::endl;    
+  // Create argument types of outlined function: Node* and pointer to environment                                  
+  SmallVector<Type*, 2> ArgTypes = { CilkWalkReturnType, EnvTy->getPointerTo() };
   // Create the outlined function type (assume void return).
   FunctionType *OutlinedFT = FunctionType::get(Type::getVoidTy(Ctx), ArgTypes, false);
   std::cout << "OUTLINE: created outline function type" << std::endl;
@@ -2370,73 +2433,149 @@ const DenseSet<Value *> &liveIns, const DenseSet<Value *> &liveOuts) {
   "cilkWalk_outlined", F.getParent());
   std::cout << "OUTLINE: created actual outlined function" << std::endl;
 
-  // Clone each block in the loop into OutlinedFn.
+  // Create entry and exit blocks 
+  BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", OutlinedFn);
+  BasicBlock *ExitBB  = BasicBlock::Create(Ctx, "exit", OutlinedFn);
+  BasicBlock *OriginalEntryBB = nullptr; // to be branched to by our new entry block
+
+  // // Pre-create PHI nodes in the exit block for each live-out
+  // DenseMap<Value*, PHINode*> LiveOutPHIs;
+  // for (auto &Entry : LiveOutEnvMapping) {
+  //   Value *liveOutVal = Entry.first;
+  //   unsigned envIndex = Entry.second;
+  //   // Create a PHI node with the live-out’s type.
+  //   PHINode *phi = PHINode::Create(liveOutVal->getType(), 0, "phi_liveout", ExitBB);
+  //   LiveOutPHIs[liveOutVal] = phi;
+  // }
+  // std::cout << "OUTLINE: pre created phi nodes" << std::endl;
+  IRBuilder<> ExitBuilder(ExitBB);
+  ExitBuilder.CreateRetVoid();
+  std::cout << "OUTLINE: created ret statement at end of exit bb" << std::endl;
+
+  // Retrieve function arguments.
+  Function::arg_iterator ArgIter = OutlinedFn->arg_begin();
+  Value *NodeArg = ArgIter++; // first argument
+  Value *EnvArg  = ArgIter++; // environment pointer
+
+  // Clone loop blocks into the outlined function 
+  // Create a mapping for cloned instructions.
   ValueToValueMapTy VMap;
-  for (BasicBlock *BB : L->getBlocks()) {
-    BasicBlock *ClonedBB = CloneBasicBlock(BB, VMap, BB->getName() + ".cloned", OutlinedFn);
-    VMap[BB] = ClonedBB;
+  DenseMap<BasicBlock*, BasicBlock*> ClonedBlocks;
+  for (BasicBlock *OrigBB : L->getBlocks()) {
+    BasicBlock *ClonedBB = CloneBasicBlock(OrigBB, VMap, ".cloned", OutlinedFn);
+    VMap[OrigBB] = ClonedBB;
+    ClonedBlocks[OrigBB] = ClonedBB;
+
+    if (OrigBB == L->getHeader()) {
+      OriginalEntryBB = ClonedBB;
+      // Iterate over PHI nodes at the beginning of BB.
+      for (auto It = ClonedBB->begin(); It != ClonedBB->end(); ) {
+        PHINode *Phi = dyn_cast<PHINode>(&*It);
+        if (!Phi)
+          break; // Once a non-PHI is found, we're done.
+        
+        Value *ExternalValue = nullptr;
+        // Check each incoming edge.
+        for (unsigned i = 0, e = Phi->getNumIncomingValues(); i < e; ++i) {
+          BasicBlock *IncomingBB = Phi->getIncomingBlock(i);
+          // If the incoming block is outside the loop, use that value.
+          if (!L->contains(IncomingBB)) {
+            ExternalValue = Phi->getIncomingValue(i);
+            break;
+          }
+        }
+        
+        if (ExternalValue) {
+          // Replace all uses of the PHI with the external value.
+          Phi->replaceAllUsesWith(ExternalValue);
+          // Erase the PHI node and update the iterator.
+          It = Phi->eraseFromParent();
+        } else {
+          ++It;
+        }
+      }
+    }
   }
-  std::cout << "OUTLINE: cloned basic blocks" << std::endl;
+  std::cout << "OUTLINE: cloned loop blocks" << std::endl;
+
+  IRBuilder<> EntryBuilder(&OutlinedFn->getEntryBlock());
+  std::cout << "OUTLINE: got first insertion point" << std::endl;
+  // Create a mapping from each original live-in to its loaded value.
+  DenseMap<Value*, Value*> LiveInMapping;
+  for (unsigned i = 0, e = LiveInVec.size(); i < e; ++i) {
+    // Create a GEP to the i-th field in the environment.
+    Value *FieldPtr = EntryBuilder.CreateStructGEP(EnvTy, EnvArg, i, "livein.ptr");
+    // Load the value from that field.
+    Value *LoadedVal = EntryBuilder.CreateLoad(EnvTy->getElementType(i), FieldPtr, "livein.load");
+    // Record the mapping: original live-in -> loaded value.
+    LiveInMapping[LiveInVec[i]] = LoadedVal;
+    std::cout << "OUTLINE: added load from env for index " << i << "out of " << LiveInVec.size() << std::endl;
+  }
+  std::cout << "OUTLINE: created Load instructions from env in entry block" << std::endl;
+  EntryBuilder.CreateBr(OriginalEntryBB);
+  std::cout << "OUTLINE: created branch from new entry to cloned old entry" << std::endl;
 
   for (BasicBlock &BB : *OutlinedFn) {
-    // Iterate over instructions (using an iterator that allows deletion).
+    // Remove metadata-marked instructions.
     for (auto InstIt = BB.begin(), E = BB.end(); InstIt != E; ) {
       Instruction *Inst = &*InstIt++;
       if (Inst->getMetadata("cilk.walk") || Inst->getMetadata("cilk.walk.control.flow"))
         Inst->eraseFromParent();
     }
-    // After removing unwanted instructions, check if the block has a terminator.
+    // If the block has no terminator, it is an exit block.
     if (!BB.getTerminator()){
       IRBuilder<> TempBuilder(&BB);
-      TempBuilder.CreateRetVoid();
-      std::cout << "OUTLINE: added return value" << std::endl;
+      // Instead of a return, branch to the centralized exit block.
+      TempBuilder.CreateBr(ExitBB);
+      std::cout << "OUTLINE: added branch to exit block" << std::endl;
+      
+      // // For every live-out defined in this block, update its PHI node.
+      // // (Assuming 'liveOuts' is the set of live-out values and that
+      // //  each live-out is defined in only one block, or else you must choose
+      // //  the appropriate final definition in the block.)
+      // for (Value *liveOut : liveOuts) {
+      //   if (Instruction *Inst = dyn_cast<Instruction>(liveOut)) {
+      //     if (Inst->getParent() == &BB) {
+      //       // Add the value as an incoming edge in its PHI node.
+      //       PHINode *phi = LiveOutPHIs[liveOut];
+      //       phi->addIncoming(Inst, &BB);
+      //     }
+      //   }
+      // }
     }
   }
-  std::cout << "OUTLINE: cleaned up cloned basic blocks to get rid of control flow" << std::endl;
-
+  
   // Remap instructions in the cloned blocks.
   for (BasicBlock &ClonedBB : *OutlinedFn) {
     for (Instruction &Inst : ClonedBB)
       RemapInstruction(&Inst, VMap, RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
   }
-  std::cout << "OUTLINE: remapped instructions in cloned blocks" << std::endl;
 
-  // Replace uses of each original live-in in OutlinedFn with the corresponding function argument.
-  // The outlined function’s argument order is: 0=current, 1..N=live-ins.
-  unsigned ArgIdx = 1;
-  for (Value *OrigLiveIn : LiveInVec) {
-    if (OrigLiveIn ->getType()->isLabelTy()){
-      std::cout << "OUTLINE: Skipping live-in of type label when creating actual call args" << std::endl;
-      continue;
-    }
-    Argument *Arg = nullptr;
-    unsigned CurIdx = 0;
-    for (Argument &A : OutlinedFn->args()) {
-      if (CurIdx == ArgIdx) {
-        Arg = &A;
-        break;
-      }
-    ++CurIdx;
-    }
-    for (BasicBlock &BB : *OutlinedFn) {
-      for (Instruction &Inst : BB) {
-        Inst.replaceUsesOfWith(OrigLiveIn, Arg);
+
+  // Now, update the cloned instructions in OutlinedFn to replace
+  // all uses of each original live-in with the corresponding loaded value.
+  for (BasicBlock &BB : *OutlinedFn) {
+    for (Instruction &Inst : BB) {
+      for (auto &Op : Inst.operands()) {
+        if (LiveInMapping.count(Op)) {
+          Op = LiveInMapping.lookup(Op);
+        }
       }
     }
-    ++ArgIdx;
   }
-  std::cout << "OUTLINE: replaced uses of original live-in with argument" << std::endl;
+  std::cout << "OUTLINE: replaced uses of original live-ins with loads from argument env" << std::endl;
+
+  
 
   // Compute live-out mapping.
   DenseMap<Value*, Value*> LiveOutMapping;
   for (Value *OrigLiveOut : liveOuts) {
     if (VMap.count(OrigLiveOut))
-      LiveOutMapping[OrigLiveOut] = VMap[OrigLiveOut];
+      LiveOutMapping[VMap[OrigLiveOut]] = OrigLiveOut;
   }
   std::cout << "OUTLINE: mapped live outs" << std::endl;
 
-  // Instead of inserting a direct call (because the dynamic "current" is not available),
-  // we generate a wrapper function that takes (Node*, EnvTy*) and calls OutlinedFn.
+  // we generate a function that takes (Node*, EnvTy*) and calls OutlinedFn.
   Function *WrapperFn = createCilkWalkWrapper(OutlinedFn, LiveInVec, EnvTy);
   std::cout << "OUTLINE: created wrapper function for cilk_walk" << std::endl;
 
@@ -2451,6 +2590,7 @@ const DenseSet<Value *> &liveIns, const DenseSet<Value *> &liveOuts) {
   OLI.WrapperFn = WrapperFn;
   OLI.LiveOutMapping = LiveOutMapping;
   OLI.LiveInVec = LiveInVec;
+  OLI.LiveOutEnvMapping = LiveOutEnvMapping;
   OLI.EnvTy = EnvTy;
   return OLI;
 }
@@ -2496,15 +2636,28 @@ DenseSet<Value *> LoopSpawningImpl::getLiveOutValues(Loop *L) {
   DenseSet<Value *> LiveOuts;
   for (BasicBlock *BB : L->getBlocks()) {
     for (Instruction &I : *BB) {
+      bool HasOutsideUse = false;
+      // Check all uses of I.
       for (User *U : I.users()) {
+        // If the user is an instruction, check its parent block.
         if (Instruction *UserInst = dyn_cast<Instruction>(U)) {
           if (!L->contains(UserInst->getParent())) {
-            LiveOuts.insert(&I);
+            HasOutsideUse = true;
             break;
           }
+        } else {
+          // Conservatively treat non-instruction uses as outside the loop.
+          HasOutsideUse = true;
+          break;
         }
       }
+      if (HasOutsideUse)
+        LiveOuts.insert(&I);
     }
+  }
+  for (Value *V : LiveOuts){
+    std::cerr << "Live out value" << std::endl;
+    V->dump();
   }
   return LiveOuts;
 }
@@ -2716,7 +2869,7 @@ bool LoopSpawningImpl::processCilkWalkLoop(Loop *L) {
   OutlinedLoopInfo outlinedLoopInfo = outlineCilkWalkLoop(L, CilkBeginWalkReturnType, liveIns, liveOuts);
   std::cout << "PROCESS: Outlined Cilk Walk Loop" << std::endl;
 
-  switchOutlinedLoopVarInitialization(L, outlinedLoopInfo.OutlinedFn);
+  switchOutlinedLoopVarInitialization(L, outlinedLoopInfo.OutlinedFn, outlinedLoopInfo.LiveOutMapping, outlinedLoopInfo.LiveOutEnvMapping);
 
   // Rewrite the call site (e.g. in CilkBeginWalk)
   // to pass the wrapper function pointer (outlinedLoopInfo.WrapperFn) along with
@@ -2724,7 +2877,8 @@ bool LoopSpawningImpl::processCilkWalkLoop(Loop *L) {
   insertEnvironmentAllocationAndCall(
     L, 
     outlinedLoopInfo.WrapperFn, 
-    outlinedLoopInfo.LiveInVec,  
+    outlinedLoopInfo.LiveInVec,
+    outlinedLoopInfo.LiveOutEnvMapping,  
     outlinedLoopInfo.EnvTy,      
     CilkBeginWalkCall);
 
