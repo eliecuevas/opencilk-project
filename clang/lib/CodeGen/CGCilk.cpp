@@ -808,6 +808,10 @@ void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S,
         if (llvm::Function *F = CB->getCalledFunction()) {
           if (F->getName().contains("CilkBeginWalk")) {
             FoundCall = CB;
+            F->addFnAttr(llvm::Attribute::OptimizeNone);
+            F->addFnAttr(llvm::Attribute::NoInline);
+            std::cout << "EMIT: changed CilkBeginWalk to no optimize and no inline" << std::endl;
+
           }
         }
       }
@@ -820,6 +824,7 @@ void CodeGenFunction::EmitCilkForRangeWalkStmt(const CilkForRangeWalkStmt &S,
         if (llvm::Function *F = CB->getCalledFunction()) {
           if (F->getName().contains("CilkBeginWalk")) {
             FoundCall = CB;
+            std::cout << "EMIT: changed CilkBeginWalk to no optimize and no inline" << std::endl;
           }
         }
       }
