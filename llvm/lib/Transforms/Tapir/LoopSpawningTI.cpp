@@ -532,7 +532,7 @@ public:
 
   void switchOutlinedLoopVarInitialization(Loop *L, Function *OutlinedFn,
                                                 DenseMap<Value*, Value*> LiveOutMapping,
-                                                DenseMap<Value *, unsigned> LiveOutEnvMapping);
+                                                DenseMap<Value *, unsigned> LiveOutEnvMapping, StructType *EnvTy);
 
   Function *createCilkWalkWrapper(Function *OutlinedFn, const SmallVector<Value*, 8> &LiveInVec, StructType *EnvTy);
 
@@ -1760,7 +1760,7 @@ void LoopSpawningImpl::insertBypassLogicForInvoke(InvokeInst *NewInvoke,
 }
 
 void LoopSpawningImpl::switchOutlinedLoopVarInitialization(Loop *L, Function *OutlinedFn, DenseMap<Value*, Value*> LiveOutMapping,
-            DenseMap<Value *, unsigned> LiveOutEnvMapping) {
+            DenseMap<Value *, unsigned> LiveOutEnvMapping, StructType *EnvTy) {
   bool done = false;
   Value *destinationPtr = nullptr; // Variable to store the destination pointer
   
@@ -1921,10 +1921,9 @@ void LoopSpawningImpl::switchOutlinedLoopVarInitialization(Loop *L, Function *Ou
         Value *castEnvPtr = Builder.CreateBitCast(EnvPtr, liveOutType->getPointerTo());
         // Compute the pointer to the environment slot using a GEP.
         Value *indexVal = Builder.getInt32(envIndex);
-        Value *envSlotPtr = Builder.CreateGEP(liveOutType, castEnvPtr, indexVal);
+        Value *envSlotPtr = Builder.CreateStructGEP(EnvTy, EnvPtr, envIndex, "liveout.ptr");
         // Insert a store that writes the cloned live-out value into the environment slot.
         Builder.CreateStore(&I, envSlotPtr);
-
         std::cout << "Inserted store for live-out value in env " << std::endl;
       }
     }
@@ -2869,7 +2868,7 @@ bool LoopSpawningImpl::processCilkWalkLoop(Loop *L) {
   OutlinedLoopInfo outlinedLoopInfo = outlineCilkWalkLoop(L, CilkBeginWalkReturnType, liveIns, liveOuts);
   std::cout << "PROCESS: Outlined Cilk Walk Loop" << std::endl;
 
-  switchOutlinedLoopVarInitialization(L, outlinedLoopInfo.OutlinedFn, outlinedLoopInfo.LiveOutMapping, outlinedLoopInfo.LiveOutEnvMapping);
+  switchOutlinedLoopVarInitialization(L, outlinedLoopInfo.OutlinedFn, outlinedLoopInfo.LiveOutMapping, outlinedLoopInfo.LiveOutEnvMapping, outlinedLoopInfo.EnvTy);
 
   // Rewrite the call site (e.g. in CilkBeginWalk)
   // to pass the wrapper function pointer (outlinedLoopInfo.WrapperFn) along with
